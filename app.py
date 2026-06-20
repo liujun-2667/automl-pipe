@@ -70,32 +70,32 @@ def step_navigation():
     st.sidebar.markdown("---")
 
     steps = [
-        "📁 数据上传与探索",
-        "⚙️ 自动特征工程",
-        "🎯 特征重要性评估",
-        "🤖 自动模型选择",
-        "📊 模型对比与诊断",
-        "� 模型可解释性分析",
-        "�📦 Pipeline导出",
+        "[1] 数据上传与探索",
+        "[2] 自动特征工程",
+        "[3] 特征重要性评估",
+        "[4] 自动模型选择",
+        "[5] 模型对比与诊断",
+        "[6] 模型可解释性分析",
+        "[7] Pipeline导出",
     ]
 
     for i, step in enumerate(steps):
         if i == st.session_state.current_step:
-            st.sidebar.markdown(f"**➡️ {step}**")
+            st.sidebar.markdown(f"**▶ {step}**")
         elif i < st.session_state.current_step:
-            st.sidebar.markdown(f"✅ {step}")
+            st.sidebar.markdown(f"✓ {step}")
         else:
-            st.sidebar.markdown(f"⬜ {step}")
+            st.sidebar.markdown(f"○ {step}")
 
     st.sidebar.markdown("---")
 
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        if st.button("⬅️ 上一步", disabled=st.session_state.current_step == 0):
+        if st.button("<- 上一步", disabled=st.session_state.current_step == 0):
             st.session_state.current_step = max(0, st.session_state.current_step - 1)
             st.rerun()
     with col2:
-        if st.button("下一步 ➡️", disabled=st.session_state.current_step >= 6):
+        if st.button("下一步 ->", disabled=st.session_state.current_step >= 6):
             st.session_state.current_step = min(6, st.session_state.current_step + 1)
             st.rerun()
 
@@ -988,11 +988,19 @@ def step_interpretability():
     feature_names = list(X.columns)
 
     if not st.session_state.interpretability_result:
-        if st.button("🚀 运行完整可解释性分析", type="primary"):
+        col_run1, col_run2 = st.columns([3, 1])
+        with col_run1:
+            output_dir = st.text_input("分析结果输出目录", value="./output", key="interp_outdir")
+        with col_run2:
+            st.write("")
+            st.write("")
+            run_full_btn = st.button("🚀 运行完整可解释性分析", type="primary")
+
+        if run_full_btn:
             with st.spinner("正在进行可解释性分析（可能需要几分钟）..."):
-                output_dir = st.text_input("分析结果输出目录", value="./output", key="interp_outdir")
                 result = pipeline.run_interpretability(output_dir=output_dir)
                 st.session_state.interpretability_result = result
+                st.success("✅ 完整分析完成！")
                 st.rerun()
 
     tab1, tab2, tab3, tab4 = st.tabs([

@@ -190,19 +190,25 @@ class LocalInterpreter:
 
                 original_val = float(sample[feat].iloc[0])
                 original_idx = np.argmin(np.abs(grid_values - original_val))
+                original_prediction = predictions[original_idx] if original_idx < len(predictions) else predictions[-1]
+                mean_prediction = float(np.mean(predictions))
+                local_contribution = original_prediction - mean_prediction
 
                 ice_results[feat] = {
                     'grid_values': grid_values.tolist(),
                     'predictions': predictions,
                     'original_value': original_val,
-                    'original_prediction': predictions[original_idx] if original_idx < len(predictions) else predictions[-1],
+                    'original_prediction': original_prediction,
+                    'mean_prediction': mean_prediction,
+                    'local_contribution': local_contribution,
+                    'local_contribution_abs': float(abs(local_contribution)),
                     'feature_std': float(feat_std),
                     'marginal_effect': float(max(predictions) - min(predictions)),
                 }
 
             sorted_feats = sorted(
                 ice_results.items(),
-                key=lambda x: x[1]['marginal_effect'],
+                key=lambda x: x[1]['local_contribution_abs'],
                 reverse=True
             )
             top_features = [f for f, _ in sorted_feats[:5]]
@@ -491,7 +497,6 @@ class AdversarialExplainer:
                 return {'error': 'One or more explainers failed on original sample'}
 
             perturbed_sample = self._generate_perturbed_sample(sample_idx)
-
             X_with_perturbed = pd.concat([self.X, perturbed_sample], ignore_index=True)
             perturbed_idx = len(X_with_perturbed) - 1
 
@@ -506,55 +511,68 @@ class AdversarialExplainer:
             if 'error' in perturbed_shap or 'error' in perturbed_lime or 'error' in perturbed_ice:
                 return {'error': 'One or more explainers failed on perturbed sample'}
 
-            def top3_kendall(rank1: List[str], rank2: List[str]) -> float:
-                all_feats = list(set(rank1[:3] + rank2[:3]))
-                if len(all_feats) < 2:
-                    return 1.0
-
-                r1 = [rank1.index(f) if f in rank1 else len(rank1) for f in all_feats]
-                r2 = [rank2.index(f) if f in rank2 else len(rank2) for f in all_feats]
-
-                try:
-                    tau, _ = kendalltau(r1, r2)
-                    return float(tau) if not np.isnan(tau) else 0.0
-                except Exception:
-                    return 0.0
-
-            tau_shap = top3_kendall(original_shap['top_features'], perturbed_shap['top_features'])
-            tau_lime = top3_kendall(original_lime['top_features'], perturbed_lime['top_features'])
-            tau_ice = top3_kendall(original_ice['top_features'], perturbed_ice['top_features'])
-
-            mean_tau = float(np.mean([tau_shap, tau_lime, tau_ice]))
-            is_sensitive = mean_tau < 0.5
-
-            original_pred = float(self.model.predict(self.X.iloc[[sample_idx]])[0])
-            perturbed_pred = float(self.model.predict(perturbed_sample)[0])
-            prediction_change = abs(original_pred - perturbed_pred)
-
-            return {
-                'sample_idx': sample_idx,
-                'is_sensitive': is_sensitive,
-                'label': '解释敏感样本' if is_sensitive else '解释稳定样本',
-                'mean_kendall_tau': mean_tau,
-                'shap_tau': tau_shap,
-                'lime_tau': tau_lime,
-                'ice_tau': tau_ice,
-                'original_prediction': original_pred,
-                'perturbed_prediction': perturbed_pred,
-                'prediction_change': float(prediction_change),
-                'original_top3': {
-                    'shap': original_shap['top_features'][:3],
-                    'lime': original_lime['top_features'][:3],
-                    'ice': original_ice['top_features'][:3],
-                },
-                'perturbed_top3': {
-                    'shap': perturbed_shap['top_features'][:3],
-                    'lime': perturbed_lime['top_features'][:3],
-                    'ice': perturbed_ice['top_features'][:3],
-                },
-            }
+            return self._compute_sensitivity_result(
+                sample_idx,
+                original_shap, original_lime, original_ice,
+                perturbed_shap, perturbed_lime, perturbed_ice,
+                perturbed_sample,
+            )
         except Exception as e:
             return {'error': str(e)}
+
+    def _compute_sensitivity_result(
+        self, sample_idx: int,
+        original_shap: Dict, original_lime: Dict, original_ice: Dict,
+        perturbed_shap: Dict, perturbed_lime: Dict, perturbed_ice: Dict,
+        perturbed_sample: pd.DataFrame,
+    ) -> Dict:
+        def top3_kendall(rank1: List[str], rank2: List[str]) -> float:
+            all_feats = list(set(rank1[:3] + rank2[:3]))
+            if len(all_feats) < 2:
+                return 1.0
+
+            r1 = [rank1.index(f) if f in rank1 else len(rank1) for f in all_feats]
+            r2 = [rank2.index(f) if f in rank2 else len(rank2) for f in all_feats]
+
+            try:
+                tau, _ = kendalltau(r1, r2)
+                return float(tau) if not np.isnan(tau) else 0.0
+            except Exception:
+                return 0.0
+
+        tau_shap = top3_kendall(original_shap['top_features'], perturbed_shap['top_features'])
+        tau_lime = top3_kendall(original_lime['top_features'], perturbed_lime['top_features'])
+        tau_ice = top3_kendall(original_ice['top_features'], perturbed_ice['top_features'])
+
+        mean_tau = float(np.mean([tau_shap, tau_lime, tau_ice]))
+        is_sensitive = mean_tau < 0.5
+
+        original_pred = float(self.model.predict(self.X.iloc[[sample_idx]])[0])
+        perturbed_pred = float(self.model.predict(perturbed_sample)[0])
+        prediction_change = abs(original_pred - perturbed_pred)
+
+        return {
+            'sample_idx': sample_idx,
+            'is_sensitive': is_sensitive,
+            'label': '解释敏感样本' if is_sensitive else '解释稳定样本',
+            'mean_kendall_tau': mean_tau,
+            'shap_tau': tau_shap,
+            'lime_tau': tau_lime,
+            'ice_tau': tau_ice,
+            'original_prediction': original_pred,
+            'perturbed_prediction': perturbed_pred,
+            'prediction_change': float(prediction_change),
+            'original_top3': {
+                'shap': original_shap['top_features'][:3],
+                'lime': original_lime['top_features'][:3],
+                'ice': original_ice['top_features'][:3],
+            },
+            'perturbed_top3': {
+                'shap': perturbed_shap['top_features'][:3],
+                'lime': perturbed_lime['top_features'][:3],
+                'ice': perturbed_ice['top_features'][:3],
+            },
+        }
 
     def batch_detect(self, sample_indices: Optional[List[int]] = None, n_samples: int = 10) -> Dict:
         if sample_indices is None:
@@ -563,11 +581,57 @@ class AdversarialExplainer:
             else:
                 sample_indices = self.rng.choice(len(self.X), size=n_samples, replace=False).tolist()
 
-        results = []
+        if not sample_indices:
+            return {
+                'total_samples': 0, 'n_sensitive': 0, 'n_stable': 0,
+                'adversarial_pass_rate': 0.0, 'sample_results': [], 'sensitive_samples': [],
+            }
+
+        n = len(sample_indices)
+
+        perturbed_samples_list = []
         for idx in sample_indices:
-            result = self.detect_sensitivity(idx)
-            if 'error' not in result:
+            perturbed_samples_list.append(self._generate_perturbed_sample(idx))
+
+        all_perturbed_X = pd.concat(perturbed_samples_list, ignore_index=True)
+        X_combined = pd.concat([self.X, all_perturbed_X], ignore_index=True)
+
+        combined_interpreter = LocalInterpreter(
+            self.model, X_combined, self.task_type, self.feature_names, self.random_state
+        )
+
+        len_X = len(self.X)
+
+        results = []
+        for i, idx in enumerate(sample_indices):
+            perturbed_idx_in_combined = len_X + i
+
+            try:
+                original_shap = self.local_interpreter.explain_shap(idx)
+                original_lime = self.local_interpreter.explain_lime(idx)
+                original_ice = self.local_interpreter.explain_ice(idx)
+
+                if 'error' in original_shap or 'error' in original_lime or 'error' in original_ice:
+                    continue
+
+                perturbed_shap = combined_interpreter.explain_shap(perturbed_idx_in_combined)
+                perturbed_lime = combined_interpreter.explain_lime(perturbed_idx_in_combined)
+                perturbed_ice = combined_interpreter.explain_ice(perturbed_idx_in_combined)
+
+                if 'error' in perturbed_shap or 'error' in perturbed_lime or 'error' in perturbed_ice:
+                    continue
+
+                perturbed_sample = perturbed_samples_list[i]
+
+                result = self._compute_sensitivity_result(
+                    idx,
+                    original_shap, original_lime, original_ice,
+                    perturbed_shap, perturbed_lime, perturbed_ice,
+                    perturbed_sample,
+                )
                 results.append(result)
+            except Exception:
+                continue
 
         n_sensitive = sum(1 for r in results if r.get('is_sensitive', False))
         pass_rate = float(1 - n_sensitive / len(results)) if results else 0.0
