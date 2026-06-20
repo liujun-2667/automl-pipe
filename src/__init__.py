@@ -27,6 +27,11 @@ __all__ = [
     'compare_models',
     'format_model_comparison',
     'PipelineExporter',
+    'LocalInterpreter',
+    'GlobalInterpreter',
+    'AdversarialExplainer',
+    'InterpretabilityReportExporter',
+    'ModelInterpretabilityAnalyzer',
     'AutoMLPipeline',
 ]
 
@@ -65,6 +70,14 @@ def __getattr__(name):
     if name == 'PipelineExporter':
         from . import pipeline_exporter
         return getattr(pipeline_exporter, name)
+
+    if name in [
+        'LocalInterpreter', 'GlobalInterpreter',
+        'AdversarialExplainer', 'InterpretabilityReportExporter',
+        'ModelInterpretabilityAnalyzer',
+    ]:
+        from . import interpretability
+        return getattr(interpretability, name)
 
     if name == 'AutoMLPipeline':
         from . import automl_pipeline

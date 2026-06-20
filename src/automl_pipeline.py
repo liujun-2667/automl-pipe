@@ -17,6 +17,7 @@ from src.feature_selection import FeatureImportanceAnalyzer, IntersectionFeature
 from src.model_selector import AutoModelSelector
 from src.model_diagnosis import ModelDiagnostician
 from src.pipeline_exporter import PipelineExporter
+from src.interpretability import ModelInterpretabilityAnalyzer
 
 warnings.filterwarnings('ignore')
 
@@ -44,6 +45,7 @@ class AutoMLPipeline:
         self.feature_selector = None
         self.model_selector = None
         self.diagnostician = None
+        self.interpretability_analyzer = None
         self.exporter = None
 
         self.X_full = None
@@ -266,6 +268,29 @@ class AutoMLPipeline:
             'overfitting_suggestions': self.diagnostician.get_overfitting_suggestions() if metrics.get('is_overfitting', False) else [],
             'learning_curve': learning_curve_data,
         }
+
+    def run_interpretability(self, output_dir: str = './output') -> Dict:
+        """运行模型可解释性分析"""
+        X = self.X_selected if self.is_feature_selected else self.X_full
+        y = self.y_full
+        best_model = self.model_selector.get_best_model()
+        best_model_name = self.model_selector.get_best_model_name() if self.model_selector else 'Unknown'
+        feature_names = list(X.columns) if X is not None else []
+
+        self.interpretability_analyzer = ModelInterpretabilityAnalyzer(
+            model=best_model,
+            X=X,
+            y=y,
+            task_type=self.task_type,
+            model_name=best_model_name,
+            feature_names=feature_names,
+            column_types=self.column_types,
+            random_state=self.random_state,
+        )
+
+        result = self.interpretability_analyzer.run_full_analysis(output_dir=output_dir)
+
+        return result
 
     def export_pipeline(
         self,

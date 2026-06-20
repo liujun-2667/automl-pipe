@@ -18,6 +18,11 @@ warnings.filterwarnings('ignore')
 
 from src.automl_pipeline import AutoMLPipeline
 from src.data_exploration import DataTypeInference, DataExplorer
+from src.interpretability import (
+    LocalInterpreter, GlobalInterpreter,
+    AdversarialExplainer, InterpretabilityReportExporter,
+    ModelInterpretabilityAnalyzer,
+)
 
 st.set_page_config(
     page_title="AutoML Pipeline - 自动特征工程与模型选择",
@@ -53,6 +58,8 @@ def init_session_state():
         st.session_state.model_selection_result = None
     if 'diagnosis_result' not in st.session_state:
         st.session_state.diagnosis_result = None
+    if 'interpretability_result' not in st.session_state:
+        st.session_state.interpretability_result = None
     if 'is_running' not in st.session_state:
         st.session_state.is_running = False
 
@@ -68,7 +75,8 @@ def step_navigation():
         "🎯 特征重要性评估",
         "🤖 自动模型选择",
         "📊 模型对比与诊断",
-        "📦 Pipeline导出",
+        "� 模型可解释性分析",
+        "�📦 Pipeline导出",
     ]
 
     for i, step in enumerate(steps):
@@ -87,8 +95,8 @@ def step_navigation():
             st.session_state.current_step = max(0, st.session_state.current_step - 1)
             st.rerun()
     with col2:
-        if st.button("下一步 ➡️", disabled=st.session_state.current_step >= 5):
-            st.session_state.current_step = min(5, st.session_state.current_step + 1)
+        if st.button("下一步 ➡️", disabled=st.session_state.current_step >= 6):
+            st.session_state.current_step = min(6, st.session_state.current_step + 1)
             st.rerun()
 
 
@@ -954,9 +962,507 @@ def step_model_diagnosis():
                 })
                 st.dataframe(lc_df, use_container_width=True)
 
-        if st.button("➡️ 下一步：导出Pipeline", type="primary"):
+        if st.button("➡️ 下一步：模型可解释性分析", type="primary"):
             st.session_state.current_step = 5
             st.rerun()
+
+
+def step_interpretability():
+    """步骤6: 模型可解释性分析"""
+    st.title("🔬 模型可解释性分析")
+    st.markdown("从多个角度理解模型决策逻辑，包括局部解释、全局解释、对抗性检测和报告导出。")
+
+    pipeline = st.session_state.pipeline
+    X = pipeline.X_selected if pipeline.is_feature_selected else pipeline.X_full
+    y = pipeline.y_full
+    best_model = None
+    best_model_name = 'Unknown'
+    if pipeline.model_selector:
+        best_model = pipeline.model_selector.get_best_model()
+        best_model_name = pipeline.model_selector.get_best_model_name()
+
+    if X is None or best_model is None:
+        st.warning("⚠️ 请先完成模型选择步骤")
+        return
+
+    feature_names = list(X.columns)
+
+    if not st.session_state.interpretability_result:
+        if st.button("🚀 运行完整可解释性分析", type="primary"):
+            with st.spinner("正在进行可解释性分析（可能需要几分钟）..."):
+                output_dir = st.text_input("分析结果输出目录", value="./output", key="interp_outdir")
+                result = pipeline.run_interpretability(output_dir=output_dir)
+                st.session_state.interpretability_result = result
+                st.rerun()
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔍 局部解释面板",
+        "🌐 全局解释面板",
+        "🛡️ 对抗性解释检测",
+        "📄 解释报告导出",
+    ])
+
+    with tab1:
+        st.header("🔍 局部解释面板")
+        st.caption("选择一条样本，同时展示三种局部解释结果对比")
+
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            sample_idx = st.number_input(
+                "选择样本索引",
+                min_value=0,
+                max_value=max(0, len(X) - 1),
+                value=0,
+                step=1,
+                key="local_sample_idx",
+            )
+
+        with col2:
+            st.markdown("**样本特征值预览:**")
+            sample_row = X.iloc[[sample_idx]]
+            st.dataframe(sample_row.T, use_container_width=True)
+
+        if st.button("🔬 分析该样本", key="run_local"):
+            with st.spinner("正在计算局部解释..."):
+                local = LocalInterpreter(
+                    best_model, X, pipeline.task_type, feature_names, pipeline.random_state
+                )
+                shap_res = local.explain_shap(sample_idx)
+                lime_res = local.explain_lime(sample_idx)
+                ice_res = local.explain_ice(sample_idx)
+
+                if 'error' in shap_res:
+                    st.error(f"SHAP解释出错: {shap_res['error']}")
+                if 'error' in lime_res:
+                    st.error(f"LIME解释出错: {lime_res['error']}")
+                if 'error' in ice_res:
+                    st.error(f"ICE解释出错: {ice_res['error']}")
+
+                if 'error' not in shap_res and 'error' not in lime_res and 'error' not in ice_res:
+                    consistency = local.compute_consistency_score(shap_res, lime_res, ice_res)
+
+                    st.markdown("---")
+                    col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+                    col_c1.metric("SHAP vs LIME (τ)", f"{consistency['kendall_shap_lime']:.3f}")
+                    col_c2.metric("SHAP vs ICE (τ)", f"{consistency['kendall_shap_ice']:.3f}")
+                    col_c3.metric("LIME vs ICE (τ)", f"{consistency['kendall_lime_ice']:.3f}")
+                    col_c4.metric(
+                        "一致性评分",
+                        f"{consistency['mean_consistency']:.3f}",
+                        delta=consistency['label'],
+                        delta_color='inverse' if consistency['is_conflict'] else 'normal',
+                    )
+                    if consistency['is_conflict']:
+                        st.warning("⚠️ **解释冲突**：三种方法的特征重要性排序一致性低于0.6，建议谨慎分析该样本的模型决策。")
+
+                    st.markdown("---")
+                    col_s1, col_s2, col_s3 = st.columns(3)
+
+                    with col_s1:
+                        st.subheader("SHAP瀑布图")
+                        if 'feature_contributions' in shap_res:
+                            fig, ax = plt.subplots(figsize=(8, 8))
+                            contribs = shap_res['feature_contributions'][:10]
+                            feats = [f"{c['feature']}={c['value']:.2f}" for c in contribs]
+                            vals = [c['shap_value'] for c in contribs]
+                            base_val = shap_res.get('base_value', 0)
+
+                            cum_vals = [base_val]
+                            for v in vals:
+                                cum_vals.append(cum_vals[-1] + v)
+
+                            colors = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals]
+                            y_pos = np.arange(len(contribs))
+
+                            for i, (feat, val, cum, color) in enumerate(zip(feats, vals, cum_vals[:-1], colors)):
+                                ax.barh(i, val, left=cum, color=color, alpha=0.8, height=0.6)
+
+                            ax.set_yticks(y_pos)
+                            ax.set_yticklabels(feats)
+                            ax.axvline(x=base_val, color='gray', linestyle='--', alpha=0.5, label=f'Base: {base_val:.3f}')
+                            ax.axvline(x=cum_vals[-1], color='blue', linestyle='-', alpha=0.7, label=f'Pred: {cum_vals[-1]:.3f}')
+                            ax.set_xlabel('SHAP值')
+                            ax.set_title(f'SHAP瀑布图 - 样本 #{sample_idx}')
+                            ax.legend()
+                            ax.invert_yaxis()
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close(fig)
+
+                    with col_s2:
+                        st.subheader("LIME特征权重")
+                        if 'feature_weights' in lime_res:
+                            fig, ax = plt.subplots(figsize=(8, 8))
+                            weights = lime_res['feature_weights'][:10]
+                            feats = [w['feature'] for w in weights]
+                            vals = [w['weight'] for w in weights]
+                            colors = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals]
+
+                            y_pos = np.arange(len(feats))
+                            ax.barh(y_pos, vals, color=colors, alpha=0.8, height=0.6)
+                            ax.set_yticks(y_pos)
+                            ax.set_yticklabels(feats)
+                            ax.axvline(x=0, color='gray', linestyle='-', alpha=0.5)
+                            ax.set_xlabel('特征权重')
+                            ax.set_title(f'LIME特征权重 - 样本 #{sample_idx}')
+                            ax.invert_yaxis()
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close(fig)
+
+                    with col_s3:
+                        st.subheader("ICE边际效应曲线")
+                        if 'ice_curves' in ice_res:
+                            ice_data = ice_res['ice_curves']
+                            if ice_data:
+                                n_feats = min(3, len(ice_data))
+                                fig, axes = plt.subplots(n_feats, 1, figsize=(8, 3 * n_feats))
+                                if n_feats == 1:
+                                    axes = [axes]
+                                for i, (feat, ice_d) in enumerate(list(ice_data.items())[:n_feats]):
+                                    axes[i].plot(ice_d['grid_values'], ice_d['predictions'], 'b-', linewidth=2)
+                                    axes[i].axvline(
+                                        x=ice_d['original_value'],
+                                        color='red',
+                                        linestyle='--',
+                                        label=f'原值: {ice_d["original_value"]:.2f}',
+                                    )
+                                    axes[i].set_xlabel(feat)
+                                    axes[i].set_ylabel('预测值')
+                                    axes[i].set_title(f'{feat} - 边际效应 (Δ={ice_d["marginal_effect"]:.4f})')
+                                    axes[i].legend()
+                                    axes[i].grid(True, alpha=0.3)
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+
+                    st.markdown("---")
+                    st.subheader("📊 TOP-5 特征重要性排序对比")
+                    compare_df = pd.DataFrame({
+                        'SHAP': shap_res.get('top_features', []),
+                        'LIME': lime_res.get('top_features', []),
+                        'ICE': ice_res.get('top_features', []),
+                    }, index=[f'Rank {i+1}' for i in range(5)])
+                    st.dataframe(compare_df, use_container_width=True)
+
+    with tab2:
+        st.header("🌐 全局解释面板")
+        st.caption("对整个验证集进行聚合分析")
+
+        global_interp = GlobalInterpreter(
+            best_model, X, y, pipeline.task_type, feature_names, pipeline.random_state
+        )
+
+        if st.button("📊 计算全局解释", key="run_global"):
+            with st.spinner("正在计算全局解释指标..."):
+                shap_global = global_interp.shap_global_importance()
+                perm_global = global_interp.permutation_importance()
+                stability = global_interp.feature_stability_analysis(shap_global)
+
+                if 'error' not in shap_global:
+                    st.session_state.interpretability_global_shap = shap_global
+                if 'error' not in perm_global:
+                    st.session_state.interpretability_global_perm = perm_global
+                if 'error' not in stability:
+                    st.session_state.interpretability_stability = stability
+
+        col_g1, col_g2 = st.columns(2)
+
+        with col_g1:
+            st.subheader("SHAP全局重要性")
+            shap_global = st.session_state.get('interpretability_global_shap')
+            if shap_global and 'importances' in shap_global:
+                top_n = min(15, len(shap_global['importances']))
+                top_data = shap_global['importances'][:top_n]
+                fig, ax = plt.subplots(figsize=(10, 8))
+                feats = [x['feature'] for x in reversed(top_data)]
+                vals = [x['mean_abs_shap'] for x in reversed(top_data)]
+                colors = ['#e74c3c' if x.get('is_unstable', False) else '#3498db' for x in reversed(top_data)]
+                ax.barh(feats, vals, color=colors, alpha=0.8)
+                ax.set_xlabel('平均 |SHAP值|')
+                ax.set_title(f'Top {top_n} 特征 SHAP 全局重要性（红色=不稳定）')
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+            else:
+                st.info("请先点击『计算全局解释』按钮")
+
+        with col_g2:
+            st.subheader("排列重要性")
+            perm_global = st.session_state.get('interpretability_global_perm')
+            if perm_global and 'importances' in perm_global:
+                top_n = min(15, len(perm_global['importances']))
+                top_data = perm_global['importances'][:top_n]
+                fig, ax = plt.subplots(figsize=(10, 8))
+                feats = [x['feature'] for x in reversed(top_data)]
+                vals = [x['importance_mean'] for x in reversed(top_data)]
+                errs = [x['importance_std'] for x in reversed(top_data)]
+                ax.barh(feats, vals, xerr=errs, color='#9b59b6', alpha=0.8, capsize=3)
+                ax.set_xlabel(f"重要性 ({perm_global.get('scoring', '')})")
+                ax.set_title(f'Top {top_n} 特征排列重要性')
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+            else:
+                st.info("请先点击『计算全局解释』按钮")
+
+        st.markdown("---")
+        st.subheader("📊 特征稳定性分析")
+        stability = st.session_state.get('interpretability_stability')
+        if stability and 'stability_summary' in stability:
+            stab = stability['stability_summary']
+            col_st1, col_st2, col_st3, col_st4 = st.columns(4)
+            col_st1.metric("SHAP标准差均值", f"{stab['mean_shap_std']:.4f}")
+            col_st2.metric("SHAP标准差中位数", f"{stab['median_shap_std']:.4f}")
+            col_st3.metric("不稳定特征数", stab['n_unstable'])
+            col_st4.metric("稳定特征数", stab['n_stable'])
+
+            col_un, col_st = st.columns(2)
+            with col_un:
+                st.markdown("#### ⚠️ 不稳定特征（对不同样本贡献差异大）")
+                if stability.get('unstable_features'):
+                    un_df = pd.DataFrame(stability['unstable_features'])[['feature', 'mean_abs_shap', 'shap_std']]
+                    un_df.columns = ['特征', 'mean(|SHAP|)', 'SHAP标准差']
+                    st.dataframe(un_df, use_container_width=True)
+                else:
+                    st.success("✅ 无明显不稳定特征")
+            with col_st:
+                st.markdown("#### ✅ 稳定特征")
+                if stability.get('stable_features'):
+                    st_df = pd.DataFrame(stability['stable_features'][:10])[['feature', 'mean_abs_shap', 'shap_std']]
+                    st_df.columns = ['特征', 'mean(|SHAP|)', 'SHAP标准差']
+                    st.dataframe(st_df, use_container_width=True)
+        else:
+            st.info("请先点击『计算全局解释』按钮")
+
+        st.markdown("---")
+        st.subheader("📈 PDP偏依赖图")
+        numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            pdp_feat1 = st.selectbox("选择特征1（用于一维PDP或二维PDP）", options=numeric_features, key="pdp_f1")
+            pdp_mode = st.radio("PDP模式", options=["一维PDP", "二维PDP"], horizontal=True)
+        with col_p2:
+            pdp_feat2 = None
+            if pdp_mode == "二维PDP":
+                pdp_feat2 = st.selectbox(
+                    "选择特征2（用于二维PDP）",
+                    options=[f for f in numeric_features if f != pdp_feat1],
+                    key="pdp_f2",
+                )
+
+        if st.button("📈 绘制PDP", key="run_pdp"):
+            with st.spinner("正在计算偏依赖图..."):
+                if pdp_mode == "一维PDP":
+                    pdp_res = global_interp.compute_pdp(pdp_feat1)
+                    if 'error' not in pdp_res:
+                        fig, ax = plt.subplots(figsize=(10, 6))
+                        ax.plot(pdp_res['grid_values'], pdp_res['partial_dependence'], 'r-', linewidth=2.5, marker='o')
+                        ax.fill_between(pdp_res['grid_values'], pdp_res['partial_dependence'], alpha=0.15, color='red')
+                        ax.set_xlabel(pdp_feat1)
+                        ax.set_ylabel('预测值（偏依赖）')
+                        ax.set_title(f'一维偏依赖图 - {pdp_feat1}')
+                        ax.grid(True, alpha=0.3)
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close(fig)
+                    else:
+                        st.error(f"PDP计算失败: {pdp_res.get('error', '未知错误')}")
+                else:
+                    pdp_res = global_interp.compute_pdp_2d(pdp_feat1, pdp_feat2)
+                    if 'error' not in pdp_res:
+                        fig, ax = plt.subplots(figsize=(10, 8))
+                        X_grid, Y_grid = np.meshgrid(pdp_res['grid_x'], pdp_res['grid_y'])
+                        Z = np.array(pdp_res['z_values']).T
+                        cs = ax.contourf(X_grid, Y_grid, Z, levels=20, cmap='RdYlBu_r', alpha=0.8)
+                        fig.colorbar(cs, ax=ax, label='预测值')
+                        cs2 = ax.contour(X_grid, Y_grid, Z, levels=10, colors='black', linewidths=0.5, alpha=0.5)
+                        ax.clabel(cs2, inline=True, fontsize=8)
+                        ax.set_xlabel(pdp_feat1)
+                        ax.set_ylabel(pdp_feat2)
+                        ax.set_title(f'二维偏依赖等高线图 - {pdp_feat1} vs {pdp_feat2}')
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close(fig)
+                    else:
+                        st.error(f"2D PDP计算失败: {pdp_res.get('error', '未知错误')}")
+
+    with tab3:
+        st.header("🛡️ 对抗性解释检测")
+        st.caption("对选定样本做微小扰动，检查解释是否稳定")
+
+        col_a1, col_a2 = st.columns(2)
+        with col_a1:
+            adv_sample_idx = st.number_input(
+                "选择样本索引进行单样本检测",
+                min_value=0,
+                max_value=max(0, len(X) - 1),
+                value=0,
+                step=1,
+                key="adv_sample_idx",
+            )
+        with col_a2:
+            n_batch = st.slider("批量检测样本数", min_value=3, max_value=min(20, len(X)), value=5, step=1)
+
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            if st.button("🔬 单样本检测", key="run_adv_single"):
+                with st.spinner("正在进行对抗性检测..."):
+                    adv = AdversarialExplainer(
+                        best_model, X, pipeline.task_type, feature_names,
+                        pipeline.column_types, pipeline.random_state,
+                    )
+                    result = adv.detect_sensitivity(adv_sample_idx)
+                    if 'error' in result:
+                        st.error(f"检测失败: {result['error']}")
+                    else:
+                        st.session_state.adv_single_result = result
+                        st.rerun()
+
+        with col_b2:
+            if st.button("📊 批量检测", key="run_adv_batch"):
+                with st.spinner("正在进行批量对抗性检测..."):
+                    adv = AdversarialExplainer(
+                        best_model, X, pipeline.task_type, feature_names,
+                        pipeline.column_types, pipeline.random_state,
+                    )
+                    result = adv.batch_detect(n_samples=n_batch)
+                    st.session_state.adv_batch_result = result
+                    st.rerun()
+
+        adv_single = st.session_state.get('adv_single_result')
+        if adv_single and 'error' not in adv_single:
+            st.markdown("---")
+            st.subheader(f"单样本检测结果 - 样本 #{adv_single['sample_idx']}")
+
+            label_color = 'red' if adv_single['is_sensitive'] else 'green'
+            st.markdown(f"### 状态: :{label_color}[{adv_single['label']}]")
+
+            col_a_s1, col_a_s2, col_a_s3, col_a_s4 = st.columns(4)
+            col_a_s1.metric("Mean Kendall τ", f"{adv_single['mean_kendall_tau']:.3f}")
+            col_a_s2.metric("SHAP τ", f"{adv_single['shap_tau']:.3f}")
+            col_a_s3.metric("LIME τ", f"{adv_single['lime_tau']:.3f}")
+            col_a_s4.metric("ICE τ", f"{adv_single['ice_tau']:.3f}")
+
+            col_a_p1, col_a_p2, col_a_p3 = st.columns(3)
+            col_a_p1.metric("原始预测", f"{adv_single['original_prediction']:.4f}")
+            col_a_p2.metric("扰动后预测", f"{adv_single['perturbed_prediction']:.4f}")
+            col_a_p3.metric("预测变化量", f"{adv_single['prediction_change']:.4f}")
+
+            if adv_single['is_sensitive']:
+                st.warning("⚠️ **解释敏感样本**：微小扰动导致解释大幅变动，该样本的模型预测可能不可靠。")
+
+            st.markdown("#### TOP-3 特征排序对比")
+            rank_df = pd.DataFrame({
+                '方法': ['SHAP', 'LIME', 'ICE'],
+                '原始TOP-3': [
+                    str(adv_single['original_top3']['shap']),
+                    str(adv_single['original_top3']['lime']),
+                    str(adv_single['original_top3']['ice']),
+                ],
+                '扰动后TOP-3': [
+                    str(adv_single['perturbed_top3']['shap']),
+                    str(adv_single['perturbed_top3']['lime']),
+                    str(adv_single['perturbed_top3']['ice']),
+                ],
+            })
+            st.dataframe(rank_df, use_container_width=True)
+
+        adv_batch = st.session_state.get('adv_batch_result')
+        if adv_batch:
+            st.markdown("---")
+            st.subheader("批量检测结果汇总")
+            col_ab1, col_ab2, col_ab3, col_ab4 = st.columns(4)
+            col_ab1.metric("检测样本数", adv_batch['total_samples'])
+            col_ab2.metric("敏感样本数", adv_batch['n_sensitive'])
+            col_ab3.metric("稳定样本数", adv_batch['n_stable'])
+            col_ab4.metric("通过率", f"{adv_batch['adversarial_pass_rate']*100:.1f}%")
+
+            if adv_batch.get('sample_results'):
+                with st.expander("📋 查看详细检测结果"):
+                    detail_rows = []
+                    for r in adv_batch['sample_results']:
+                        detail_rows.append({
+                            '样本索引': f"#{r['sample_idx']}",
+                            '状态': r['label'],
+                            'Mean τ': f"{r['mean_kendall_tau']:.3f}",
+                            'SHAP τ': f"{r['shap_tau']:.3f}",
+                            'LIME τ': f"{r['lime_tau']:.3f}",
+                            'ICE τ': f"{r['ice_tau']:.3f}",
+                            '预测变化': f"{r['prediction_change']:.4f}",
+                        })
+                    detail_df = pd.DataFrame(detail_rows)
+                    st.dataframe(detail_df, use_container_width=True)
+
+            if adv_batch.get('sensitive_samples'):
+                st.markdown("#### ⚠️ 敏感样本列表")
+                sensitive_indices = [str(r['sample_idx']) for r in adv_batch['sensitive_samples']]
+                st.info(f"样本索引: {', '.join(sensitive_indices)}")
+
+    with tab4:
+        st.header("📄 解释报告导出")
+        st.caption("将所有分析结果汇总为一份交互式HTML报告")
+
+        report_dir = st.text_input("报告输出目录", value="./output", key="report_dir")
+
+        if st.button("📤 生成并导出HTML报告", type="primary", key="gen_report"):
+            with st.spinner("正在生成HTML报告（可能需要几分钟）..."):
+                try:
+                    reporter = InterpretabilityReportExporter(
+                        best_model, X, y, pipeline.task_type, best_model_name,
+                        feature_names, pipeline.column_types, pipeline.random_state,
+                    )
+                    import os
+                    os.makedirs(report_dir, exist_ok=True)
+                    report_path = os.path.join(report_dir, 'interpretability_report.html')
+                    result = reporter.export_html_report(report_path)
+
+                    if 'error' in result:
+                        st.error(f"报告生成失败: {result['error']}")
+                    else:
+                        summary = result.get('summary', {})
+                        st.success(f"✅ 报告已生成: {result.get('output_path', report_path)}")
+
+                        st.markdown("---")
+                        st.subheader("📋 报告摘要")
+                        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+                        col_r1.metric("模型", summary.get('model_name', 'Unknown'))
+                        col_r2.metric("特征数", summary.get('n_features', 0))
+                        col_r3.metric("样本数", f"{summary.get('n_samples', 0):,}")
+                        col_r4.metric(
+                            "可信度评级",
+                            summary.get('credibility_grade', '未知'),
+                        )
+
+                        col_r5, col_r6 = st.columns(2)
+                        col_r5.metric("整体一致性评分", f"{summary.get('overall_consistency', 0):.3f}")
+                        col_r6.metric("对抗性检测通过率", f"{summary.get('adversarial_pass_rate', 0)*100:.1f}%")
+
+                        grade = summary.get('credibility_grade', '')
+                        grade_color = {'高': 'green', '中': 'orange', '低': 'red'}.get(grade, 'gray')
+                        st.markdown(f"<h3 style='color: {grade_color};'>🏆 模型可信度评级: {grade}</h3>", unsafe_allow_html=True)
+                        st.info(f"💡 {summary.get('suggestion', '')}")
+
+                        if os.path.exists(report_path):
+                            with open(report_path, 'r', encoding='utf-8') as f:
+                                html_bytes = f.read().encode('utf-8')
+                            st.download_button(
+                                label="📥 下载HTML报告",
+                                data=html_bytes,
+                                file_name='interpretability_report.html',
+                                mime='text/html',
+                            )
+                except Exception as e:
+                    st.error(f"报告生成异常: {str(e)}")
+
+        if st.session_state.interpretability_result:
+            st.markdown("---")
+            st.info("💡 已完成完整分析，可直接使用上方按钮导出报告")
+
+    if st.button("➡️ 下一步：导出Pipeline", type="primary"):
+        st.session_state.current_step = 6
+        st.rerun()
 
 
 def step_export():
@@ -1018,6 +1524,7 @@ def main():
         step_feature_selection,
         step_model_selection,
         step_model_diagnosis,
+        step_interpretability,
         step_export,
     ]
 
