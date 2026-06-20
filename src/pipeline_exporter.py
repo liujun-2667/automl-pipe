@@ -42,6 +42,7 @@ class PipelineExporter:
         self.model_info = {}
         self.dataset_info = {}
         self.performance_metrics = {}
+        self.feature_stats = {}
 
     def set_model_info(
         self,
@@ -468,6 +469,469 @@ if __name__ == "__main__":
 
         return output_path
 
+    def compute_feature_stats(self, X: pd.DataFrame) -> Dict:
+        """计算训练数据的特征统计信息，用于漂移检测
+
+        Args:
+            X: 训练特征数据
+
+        Returns:
+            特征统计信息字典
+        """
+        stats = {}
+
+        numeric_cols = X.select_dtypes(include=['number']).columns.tolist()
+        categorical_cols = [
+            col for col in X.columns
+            if col not in numeric_cols
+        ]
+
+        stats['numeric'] = {}
+        for col in numeric_cols:
+            series = X[col].dropna()
+            if len(series) > 0:
+                col_stats = {
+                    'mean': float(series.mean()),
+                    'std': float(series.std()),
+                    'min': float(series.min()),
+                    'max': float(series.max()),
+                    'median': float(series.median()),
+                    'q25': float(series.quantile(0.25)),
+                    'q75': float(series.quantile(0.75)),
+                    'n_samples': int(len(series)),
+                    'missing_rate': float(X[col].isna().sum() / len(X)),
+                }
+                try:
+                    from scipy.stats import skew, kurtosis
+                    col_stats['skewness'] = float(skew(series))
+                    col_stats['kurtosis'] = float(kurtosis(series))
+                except Exception:
+                    col_stats['skewness'] = 0.0
+                    col_stats['kurtosis'] = 0.0
+                stats['numeric'][col] = col_stats
+
+        stats['categorical'] = {}
+        for col in categorical_cols:
+            series = X[col].dropna().astype(str)
+            if len(series) > 0:
+                value_counts = series.value_counts(normalize=True)
+                stats['categorical'][col] = {
+                    'n_unique': int(series.nunique()),
+                    'top_value': str(value_counts.index[0]),
+                    'top_frequency': float(value_counts.iloc[0]),
+                    'n_samples': int(len(series)),
+                    'missing_rate': float(X[col].isna().sum() / len(X)),
+                    'distribution': {
+                        str(k): float(v)
+                        for k, v in value_counts.head(20).items()
+                    }
+                }
+
+        self.feature_stats = stats
+        return stats
+
+    def generate_drift_detector(self, output_path: str) -> str:
+        """生成数据漂移检测脚本 drift_detector.py
+
+        Args:
+            output_path: 输出文件路径
+
+        Returns:
+            文件路径
+        """
+        template = '''"""
+自动生成的数据漂移检测脚本
+加载训练时的特征统计信息，对新来的数据逐列做KS检验，
+检测哪些特征发生了显著漂移（p值小于0.05），方便上线后监控。
+"""
+
+import pickle
+import joblib
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Tuple, Optional
+import warnings
+import json
+import os
+
+warnings.filterwarnings("ignore")
+
+try:
+    from scipy import stats
+except ImportError:
+    stats = None
+
+
+class FeatureDriftDetector:
+    """特征漂移检测器"""
+
+    def __init__(self, stats_path: str, p_threshold: float = 0.05):
+        """
+        初始化漂移检测器
+
+        Args:
+            stats_path: 特征统计文件路径（.json 或 .pkl / .joblib）
+            p_threshold: 显著性水平阈值，默认 0.05
+        """
+        self.p_threshold = p_threshold
+        self.reference_stats = self._load_stats(stats_path)
+        self.drift_results = {}
+
+    def _load_stats(self, stats_path: str) -> Dict:
+        """加载参考统计数据"""
+        if not os.path.exists(stats_path):
+            raise FileNotFoundError(f"统计文件不存在: {stats_path}")
+
+        ext = os.path.splitext(stats_path)[1].lower()
+
+        if ext == '.json':
+            with open(stats_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        elif ext == '.pkl':
+            with open(stats_path, 'rb') as f:
+                data = pickle.load(f)
+                return data.get('feature_stats', data)
+        elif ext == '.joblib':
+            data = joblib.load(stats_path)
+            return data.get('feature_stats', data)
+        else:
+            try:
+                with open(stats_path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception:
+                with open(stats_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+
+    def detect_numeric_drift(self, new_data: pd.DataFrame) -> List[Dict]:
+        """
+        检测数值型特征的漂移（KS检验）
+
+        Args:
+            new_data: 新数据 DataFrame
+
+        Returns:
+            漂移检测结果列表
+        """
+        if stats is None:
+            print("警告: scipy 未安装，无法执行 KS 检验")
+            return []
+
+        results = []
+        numeric_stats = self.reference_stats.get('numeric', {})
+
+        for col, ref_stat in numeric_stats.items():
+            if col not in new_data.columns:
+                results.append({
+                    'feature': col,
+                    'type': 'numeric',
+                    'drift_detected': True,
+                    'drift_type': 'missing_column',
+                    'message': f'特征 {col} 在新数据中不存在',
+                    'p_value': None,
+                    'ks_statistic': None,
+                })
+                continue
+
+            new_series = new_data[col].dropna()
+            if len(new_series) < 2:
+                results.append({
+                    'feature': col,
+                    'type': 'numeric',
+                    'drift_detected': False,
+                    'drift_type': 'insufficient_data',
+                    'message': f'特征 {col} 有效样本数不足',
+                    'p_value': None,
+                    'ks_statistic': None,
+                })
+                continue
+
+            try:
+                ref_mean = ref_stat.get('mean', 0)
+                ref_std = ref_stat.get('std', 1) or 1
+
+                ref_samples = np.random.normal(
+                    ref_mean, ref_std,
+                    size=max(len(new_series), 1000)
+                )
+
+                ks_stat, p_value = stats.ks_2samp(
+                    ref_samples,
+                    new_series.values
+                )
+
+                drift_detected = p_value < self.p_threshold
+
+                new_mean = float(new_series.mean())
+                new_std = float(new_series.std())
+
+                mean_shift_pct = ((new_mean - ref_mean) / abs(ref_mean) * 100) if ref_mean != 0 else 0
+
+                results.append({
+                    'feature': col,
+                    'type': 'numeric',
+                    'drift_detected': drift_detected,
+                    'drift_type': 'distribution_shift' if drift_detected else 'no_drift',
+                    'p_value': round(float(p_value), 6),
+                    'ks_statistic': round(float(ks_stat), 6),
+                    'ref_mean': round(ref_mean, 4),
+                    'new_mean': round(new_mean, 4),
+                    'mean_shift_pct': round(mean_shift_pct, 2),
+                    'ref_std': round(ref_std, 4),
+                    'new_std': round(new_std, 4),
+                    'message': f'{"检测到漂移" if drift_detected else "无显著漂移"} (p={p_value:.4f})',
+                })
+            except Exception as e:
+                results.append({
+                    'feature': col,
+                    'type': 'numeric',
+                    'drift_detected': False,
+                    'drift_type': 'error',
+                    'message': f'检测失败: {str(e)}',
+                    'p_value': None,
+                    'ks_statistic': None,
+                })
+
+        return results
+
+    def detect_categorical_drift(self, new_data: pd.DataFrame) -> List[Dict]:
+        """
+        检测分类型特征的漂移（卡方检验 / PSI）
+
+        Args:
+            new_data: 新数据 DataFrame
+
+        Returns:
+            漂移检测结果列表
+        """
+        results = []
+        cat_stats = self.reference_stats.get('categorical', {})
+
+        for col, ref_stat in cat_stats.items():
+            if col not in new_data.columns:
+                results.append({
+                    'feature': col,
+                    'type': 'categorical',
+                    'drift_detected': True,
+                    'drift_type': 'missing_column',
+                    'message': f'特征 {col} 在新数据中不存在',
+                })
+                continue
+
+            new_series = new_data[col].dropna().astype(str)
+            if len(new_series) == 0:
+                results.append({
+                    'feature': col,
+                    'type': 'categorical',
+                    'drift_detected': True,
+                    'drift_type': 'all_missing',
+                    'message': f'特征 {col} 全部为缺失值',
+                })
+                continue
+
+            ref_dist = ref_stat.get('distribution', {})
+            new_dist = new_series.value_counts(normalize=True).to_dict()
+
+            psi = self._calculate_psi(ref_dist, new_dist)
+
+            drift_detected = psi > 0.25
+
+            results.append({
+                'feature': col,
+                'type': 'categorical',
+                'drift_detected': drift_detected,
+                'drift_type': 'distribution_shift' if drift_detected else 'no_drift',
+                'psi': round(psi, 6),
+                'ref_top_value': ref_stat.get('top_value', ''),
+                'new_top_value': max(new_dist, key=new_dist.get) if new_dist else '',
+                'message': self._psi_interpretation(psi),
+            })
+
+        return results
+
+    def _calculate_psi(self, expected: Dict, actual: Dict) -> float:
+        """计算 PSI (Population Stability Index)"""
+        all_categories = set(expected.keys()) | set(actual.keys())
+        if not all_categories:
+            return 0.0
+
+        epsilon = 1e-6
+        psi = 0.0
+
+        for cat in all_categories:
+            e = expected.get(cat, epsilon / 2)
+            a = actual.get(cat, epsilon / 2)
+
+            if e == 0:
+                e = epsilon
+            if a == 0:
+                a = epsilon
+
+            psi += (e - a) * np.log(e / a)
+
+        return float(psi)
+
+    def _psi_interpretation(self, psi: float) -> str:
+        """PSI 结果解释"""
+        if psi < 0.1:
+            return f'无显著漂移 (PSI={psi:.4f})'
+        elif psi < 0.25:
+            return f'轻度漂移 (PSI={psi:.4f})'
+        else:
+            return f'显著漂移 (PSI={psi:.4f})'
+
+    def detect_all_drift(self, new_data: pd.DataFrame) -> Dict:
+        """
+        检测所有特征的漂移
+
+        Args:
+            new_data: 新数据 DataFrame
+
+        Returns:
+            完整的漂移检测结果
+        """
+        numeric_results = self.detect_numeric_drift(new_data)
+        categorical_results = self.detect_categorical_drift(new_data)
+
+        all_results = numeric_results + categorical_results
+
+        drifted_features = [
+            r for r in all_results
+            if r.get('drift_detected', False)
+        ]
+
+        summary = {
+            'total_features': len(all_results),
+            'drifted_count': len(drifted_features),
+            'drifted_ratio': round(len(drifted_features) / max(len(all_results), 1), 4),
+            'numeric_drifted': sum(1 for r in numeric_results if r.get('drift_detected')),
+            'categorical_drifted': sum(1 for r in categorical_results if r.get('drift_detected')),
+            'drifted_features': [r['feature'] for r in drifted_features],
+        }
+
+        self.drift_results = {
+            'summary': summary,
+            'numeric': numeric_results,
+            'categorical': categorical_results,
+            'all': all_results,
+        }
+
+        return self.drift_results
+
+    def print_report(self):
+        """打印漂移检测报告"""
+        if not self.drift_results:
+            print("请先调用 detect_all_drift() 方法")
+            return
+
+        summary = self.drift_results['summary']
+
+        print('=' * 60)
+        print('数据漂移检测报告')
+        print('=' * 60)
+        print(f'总特征数: {summary["total_features"]}')
+        print(f'漂移特征数: {summary["drifted_count"]}')
+        print(f'漂移比例: {summary["drifted_ratio"] * 100:.2f}%')
+        print(f'数值型漂移: {summary["numeric_drifted"]}')
+        print(f'分类型漂移: {summary["categorical_drifted"]}')
+        print()
+
+        if summary['drifted_features']:
+            print('⚠️  发生漂移的特征:')
+            for feat in summary['drifted_features']:
+                print(f'   - {feat}')
+            print()
+        else:
+            print('✅ 未检测到显著漂移')
+            print()
+
+        print('-' * 60)
+        print('详细结果:')
+        print('-' * 60)
+
+        for result in self.drift_results['all']:
+            status = '❌' if result.get('drift_detected') else '✅'
+            print(f'{status} {result["feature"]} ({result["type"]}): {result.get("message", "")}')
+
+        print('=' * 60)
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """将检测结果转换为 DataFrame"""
+        if not self.drift_results:
+            return pd.DataFrame()
+
+        return pd.DataFrame(self.drift_results['all'])
+
+
+def main():
+    """命令行入口"""
+    import sys
+
+    if len(sys.argv) < 3:
+        print("用法: python drift_detector.py <stats_file> <new_data_csv>")
+        print()
+        print("示例:")
+        print("  python drift_detector.py feature_stats.json new_data.csv")
+        sys.exit(1)
+
+    stats_path = sys.argv[1]
+    data_path = sys.argv[2]
+
+    if not os.path.exists(data_path):
+        print(f"错误: 数据文件不存在: {data_path}")
+        sys.exit(1)
+
+    try:
+        new_data = pd.read_csv(data_path)
+    except Exception as e:
+        print(f"读取数据失败: {e}")
+        sys.exit(1)
+
+    detector = FeatureDriftDetector(stats_path)
+
+    print(f"加载新数据: {len(new_data)} 行, {len(new_data.columns)} 列")
+    print()
+
+    result = detector.detect_all_drift(new_data)
+    detector.print_report()
+
+    return result
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+        dir_path = os.path.dirname(output_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(template)
+
+        return output_path
+
+    def export_feature_stats(self, output_path: str) -> str:
+        """导出特征统计信息为 JSON 格式
+
+        Args:
+            output_path: 输出文件路径
+
+        Returns:
+            文件路径
+        """
+        if not self.feature_stats:
+            return ''
+
+        dir_path = os.path.dirname(output_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+
+        import json
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(self.feature_stats, f, indent=2, ensure_ascii=False)
+
+        return output_path
+
     def export_all(
         self,
         output_dir: str,
@@ -494,6 +958,16 @@ if __name__ == "__main__":
         card_path = os.path.join(output_dir, 'model_card.md')
         self.generate_model_card(card_path)
         results['model_card'] = card_path
+
+        if X_sample is not None and hasattr(X_sample, 'columns') and len(X_sample.columns) > 0:
+            self.compute_feature_stats(X_sample)
+            stats_path = os.path.join(output_dir, 'feature_stats.json')
+            self.export_feature_stats(stats_path)
+            results['feature_stats'] = stats_path
+
+            drift_path = os.path.join(output_dir, 'drift_detector.py')
+            self.generate_drift_detector(drift_path)
+            results['drift_detector'] = drift_path
 
         if include_onnx and X_sample is not None:
             onnx_path = os.path.join(output_dir, 'model.onnx')

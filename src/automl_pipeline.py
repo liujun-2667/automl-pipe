@@ -248,11 +248,16 @@ class AutoMLPipeline:
 
         shap_data = self.diagnostician.get_shap_values(best_model, X)
 
+        learning_curve_data = self.diagnostician.learning_curve_analysis(
+            best_model, X, y, cv=3
+        )
+
         return {
             'metrics': metrics,
             'shap_data': shap_data,
             'is_overfitting': metrics.get('is_overfitting', False),
             'overfitting_suggestions': self.diagnostician.get_overfitting_suggestions() if metrics.get('is_overfitting', False) else [],
+            'learning_curve': learning_curve_data,
         }
 
     def export_pipeline(

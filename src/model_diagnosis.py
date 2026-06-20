@@ -225,6 +225,148 @@ class ModelDiagnostician:
             "增加交叉验证折数",
         ]
 
+    def learning_curve_analysis(
+        self,
+        model,
+        X: pd.DataFrame,
+        y: pd.Series,
+        train_sizes: Optional[List[float]] = None,
+        cv: int = 5,
+    ) -> Dict:
+        """学习曲线分析
+
+        使用不同比例的训练数据进行交叉验证，绘制训练集和验证集得分曲线，
+        帮助判断模型是欠拟合还是过拟合，以及增加数据是否有帮助。
+
+        Args:
+            model: 模型实例
+            X: 特征数据
+            y: 目标变量
+            train_sizes: 训练数据比例列表，默认 [0.1, 0.3, 0.5, 0.7, 1.0]
+            cv: 交叉验证折数
+
+        Returns:
+            学习曲线分析结果字典
+        """
+        from sklearn.model_selection import cross_validate, StratifiedKFold, KFold
+        from sklearn.base import clone
+        import time
+
+        if train_sizes is None:
+            train_sizes = [0.1, 0.3, 0.5, 0.7, 1.0]
+
+        train_sizes = sorted(train_sizes)
+
+        if self.task_type in ['binary', 'multiclass']:
+            cv_splitter = StratifiedKFold(
+                n_splits=cv,
+                shuffle=True,
+                random_state=self.random_state
+            )
+            scoring = 'accuracy'
+        else:
+            cv_splitter = KFold(
+                n_splits=cv,
+                shuffle=True,
+                random_state=self.random_state
+            )
+            scoring = 'r2'
+
+        train_scores_mean = []
+        train_scores_std = []
+        test_scores_mean = []
+        test_scores_std = []
+        train_sample_sizes = []
+
+        X_arr = X.values if isinstance(X, pd.DataFrame) else X
+        y_arr = y.values if isinstance(y, pd.Series) else y
+
+        for train_size in train_sizes:
+            n_samples = int(len(X_arr) * train_size)
+            n_samples = max(n_samples, 10)
+            n_samples = min(n_samples, len(X_arr))
+            train_sample_sizes.append(n_samples)
+
+            fold_train_scores = []
+            fold_test_scores = []
+
+            try:
+                for fold_idx, (train_idx, test_idx) in enumerate(cv_splitter.split(X_arr, y_arr)):
+                    X_train_fold = X_arr[train_idx]
+                    y_train_fold = y_arr[train_idx]
+                    X_test_fold = X_arr[test_idx]
+                    y_test_fold = y_arr[test_idx]
+
+                    n_train_use = int(len(X_train_fold) * train_size)
+                    n_train_use = max(n_train_use, 10)
+                    n_train_use = min(n_train_use, len(X_train_fold))
+
+                    indices = np.random.choice(
+                        len(X_train_fold),
+                        size=n_train_use,
+                        replace=False
+                    )
+
+                    X_train_sub = X_train_fold[indices]
+                    y_train_sub = y_train_fold[indices]
+
+                    model_clone = clone(model)
+                    model_clone.fit(X_train_sub, y_train_sub)
+
+                    train_score = model_clone.score(X_train_sub, y_train_sub)
+                    test_score = model_clone.score(X_test_fold, y_test_fold)
+
+                    fold_train_scores.append(train_score)
+                    fold_test_scores.append(test_score)
+            except Exception as e:
+                fold_train_scores = [0.0]
+                fold_test_scores = [0.0]
+
+            train_scores_mean.append(np.mean(fold_train_scores))
+            train_scores_std.append(np.std(fold_train_scores))
+            test_scores_mean.append(np.mean(fold_test_scores))
+            test_scores_std.append(np.std(fold_test_scores))
+
+        final_train_score = train_scores_mean[-1]
+        final_test_score = test_scores_mean[-1]
+        score_gap = final_train_score - final_test_score
+
+        test_score_increase = test_scores_mean[-1] - test_scores_mean[0]
+        train_score_increase = train_scores_mean[-1] - train_scores_mean[0]
+
+        is_underfitting = score_gap < 0.05 and final_test_score < 0.7
+        is_overfitting = score_gap > 0.1 and final_train_score > 0.85
+        needs_more_data = (test_scores_mean[-1] > test_scores_mean[-2]) and (
+            test_scores_mean[-1] - test_scores_mean[0] > 0.05
+        )
+
+        suggestions = []
+        if is_underfitting:
+            suggestions.append("模型可能处于欠拟合状态，建议增加模型复杂度或增加特征")
+        if is_overfitting:
+            suggestions.append("模型可能处于过拟合状态，建议增加正则化或减少特征")
+        if needs_more_data:
+            suggestions.append("验证分数仍在上升，增加更多数据可能进一步提升性能")
+        if not suggestions:
+            suggestions.append("模型状态良好，训练数据量适中")
+
+        return {
+            'train_sizes': train_sizes,
+            'train_sample_sizes': train_sample_sizes,
+            'train_scores_mean': [round(float(s), 4) for s in train_scores_mean],
+            'train_scores_std': [round(float(s), 4) for s in train_scores_std],
+            'test_scores_mean': [round(float(s), 4) for s in test_scores_mean],
+            'test_scores_std': [round(float(s), 4) for s in test_scores_std],
+            'final_train_score': round(float(final_train_score), 4),
+            'final_test_score': round(float(final_test_score), 4),
+            'score_gap': round(float(score_gap), 4),
+            'is_underfitting': is_underfitting,
+            'is_overfitting': is_overfitting,
+            'needs_more_data': needs_more_data,
+            'suggestions': suggestions,
+            'scoring': scoring,
+        }
+
 
 def compare_models(results_df: pd.DataFrame, task_type: str) -> pd.DataFrame:
     """对比所有模型"""

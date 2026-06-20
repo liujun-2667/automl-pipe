@@ -687,3 +687,200 @@ class AutoFeatureEngineer:
     def get_feature_names(self) -> List[str]:
         """获取最终特征名称"""
         return self.feature_names_.copy()
+
+
+class FeatureInteractionExplorer:
+    """特征交互探索器"""
+
+    def __init__(self, df: pd.DataFrame, column_types: Dict[str, str], target_col: str = None):
+        self.df = df
+        self.column_types = column_types
+        self.target_col = target_col
+
+    def get_available_features(self) -> Dict[str, List[str]]:
+        """获取可用的特征列表"""
+        return {
+            'numeric': [c for c, t in self.column_types.items() if t == 'numeric' and c != self.target_col],
+            'categorical': [c for c, t in self.column_types.items() if t == 'categorical' and c != self.target_col],
+        }
+
+    def _mutual_info_classification(self, feature: pd.Series, target: pd.Series) -> float:
+        """计算分类任务的互信息"""
+        try:
+            from sklearn.feature_selection import mutual_info_classif
+            x = feature.values.reshape(-1, 1)
+            y = target.values
+            if feature.dtype == 'object' or str(feature.dtype) == 'category':
+                from sklearn.preprocessing import LabelEncoder
+                le = LabelEncoder()
+                x = le.fit_transform(feature.fillna('missing')).reshape(-1, 1)
+            else:
+                x = pd.to_numeric(feature, errors='coerce').fillna(0).values.reshape(-1, 1)
+            mi = mutual_info_classif(x, y, discrete_features='auto', random_state=42)
+            return round(float(mi[0]), 4)
+        except Exception:
+            return 0.0
+
+    def _mutual_info_regression(self, feature: pd.Series, target: pd.Series) -> float:
+        """计算回归任务的互信息"""
+        try:
+            from sklearn.feature_selection import mutual_info_regression
+            x = feature.values.reshape(-1, 1)
+            if feature.dtype == 'object' or str(feature.dtype) == 'category':
+                from sklearn.preprocessing import LabelEncoder
+                le = LabelEncoder()
+                x = le.fit_transform(feature.fillna('missing')).reshape(-1, 1)
+            else:
+                x = pd.to_numeric(feature, errors='coerce').fillna(0).values.reshape(-1, 1)
+            y = pd.to_numeric(target, errors='coerce').fillna(0).values
+            mi = mutual_info_regression(x, y, random_state=42)
+            return round(float(mi[0]), 4)
+        except Exception:
+            return 0.0
+
+    def calculate_mutual_info(self, feature_col: str, task_type: str = 'binary') -> float:
+        """计算单个特征与目标变量的互信息"""
+        if self.target_col is None or self.target_col not in self.df.columns:
+            return 0.0
+
+        feature = self.df[feature_col].copy()
+        target = self.df[self.target_col].copy()
+
+        valid_mask = feature.notna() & target.notna()
+        feature = feature[valid_mask]
+        target = target[valid_mask]
+
+        if len(feature) == 0:
+            return 0.0
+
+        if task_type in ['binary', 'multiclass']:
+            return self._mutual_info_classification(feature, target)
+        else:
+            return self._mutual_info_regression(feature, target)
+
+    def calculate_pair_mutual_info(self, col1: str, col2: str, task_type: str = 'binary') -> Dict:
+        """计算特征对与目标变量的联合互信息（近似）"""
+        if self.target_col is None or self.target_col not in self.df.columns:
+            return {'mi_col1': 0.0, 'mi_col2': 0.0, 'mi_pair': 0.0}
+
+        mi_col1 = self.calculate_mutual_info(col1, task_type)
+        mi_col2 = self.calculate_mutual_info(col2, task_type)
+
+        mi_pair = round(mi_col1 + mi_col2, 4)
+
+        return {
+            'mi_col1': mi_col1,
+            'mi_col2': mi_col2,
+            'mi_pair': mi_pair,
+        }
+
+    def analyze_interaction(self, col1: str, col2: str, task_type: str = 'binary') -> Dict:
+        """分析两个特征的交互效果"""
+        if col1 not in self.column_types or col2 not in self.column_types:
+            return {'error': '列不存在'}
+
+        type1 = self.column_types[col1]
+        type2 = self.column_types[col2]
+
+        mi_info = self.calculate_pair_mutual_info(col1, col2, task_type)
+
+        df_clean = self.df[[col1, col2]].dropna()
+
+        if type1 == 'numeric' and type2 == 'numeric':
+            return self._numeric_numeric_interaction(col1, col2, df_clean, mi_info)
+        elif type1 == 'numeric' and type2 == 'categorical':
+            return self._numeric_categorical_interaction(col1, col2, df_clean, mi_info)
+        elif type1 == 'categorical' and type2 == 'numeric':
+            return self._numeric_categorical_interaction(col2, col1, df_clean, mi_info)
+        elif type1 == 'categorical' and type2 == 'categorical':
+            return self._categorical_categorical_interaction(col1, col2, df_clean, mi_info)
+        else:
+            return {'error': '不支持的列类型组合'}
+
+    def _numeric_numeric_interaction(self, col1: str, col2: str, df_clean: pd.DataFrame, mi_info: Dict) -> Dict:
+        """两个数值列的交互分析"""
+        x = df_clean[col1].values
+        y = df_clean[col2].values
+
+        if len(x) < 2:
+            correlation = 0.0
+        else:
+            correlation = round(float(np.corrcoef(x, y)[0, 1]), 4)
+            if np.isnan(correlation):
+                correlation = 0.0
+
+        return {
+            'type': 'numeric_numeric',
+            'col1': col1,
+            'col2': col2,
+            'correlation': correlation,
+            'n_samples': len(df_clean),
+            'mi_info': mi_info,
+            'plot_data': {
+                'x': x.tolist(),
+                'y': y.tolist(),
+            }
+        }
+
+    def _numeric_categorical_interaction(self, num_col: str, cat_col: str, df_clean: pd.DataFrame, mi_info: Dict) -> Dict:
+        """数值列和分类列的交互分析"""
+        groups = {}
+        for cat, group in df_clean.groupby(cat_col):
+            groups[str(cat)] = {
+                'values': group[num_col].values.tolist(),
+                'mean': round(float(group[num_col].mean()), 4),
+                'median': round(float(group[num_col].median()), 4),
+                'count': len(group),
+            }
+
+        try:
+            from scipy.stats import f_oneway
+            group_values = [g['values'] for g in groups.values() if len(g['values']) > 1]
+            if len(group_values) >= 2:
+                f_stat, p_val = f_oneway(*group_values)
+                f_stat = round(float(f_stat), 4)
+                p_val = round(float(p_val), 4)
+            else:
+                f_stat = 0.0
+                p_val = 1.0
+        except Exception:
+            f_stat = 0.0
+            p_val = 1.0
+
+        return {
+            'type': 'numeric_categorical',
+            'numeric_col': num_col,
+            'categorical_col': cat_col,
+            'groups': groups,
+            'f_statistic': f_stat,
+            'p_value': p_val,
+            'n_samples': len(df_clean),
+            'mi_info': mi_info,
+        }
+
+    def _categorical_categorical_interaction(self, col1: str, col2: str, df_clean: pd.DataFrame, mi_info: Dict) -> Dict:
+        """两个分类列的交互分析"""
+        cross_tab = pd.crosstab(df_clean[col1], df_clean[col2])
+
+        try:
+            from scipy.stats import chi2_contingency
+            chi2, p_val, dof, expected = chi2_contingency(cross_tab)
+            chi2 = round(float(chi2), 4)
+            p_val = round(float(p_val), 4)
+        except Exception:
+            chi2 = 0.0
+            p_val = 1.0
+
+        return {
+            'type': 'categorical_categorical',
+            'col1': col1,
+            'col2': col2,
+            'cross_tab': cross_tab.to_dict(),
+            'chi_square': chi2,
+            'p_value': p_val,
+            'n_samples': len(df_clean),
+            'mi_info': mi_info,
+            'columns': cross_tab.columns.tolist(),
+            'index': cross_tab.index.tolist(),
+            'values': cross_tab.values.tolist(),
+        }

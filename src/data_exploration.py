@@ -299,3 +299,151 @@ def load_csv(file_path: str, encoding: str = 'utf-8') -> pd.DataFrame:
         except:
             continue
     raise ValueError("无法读取CSV文件，请检查文件编码格式")
+
+
+class DataQualityScorer:
+    """数据质量评分器"""
+
+    GRADE_EXCELLENT = '优秀'
+    GRADE_GOOD = '良好'
+    GRADE_FAIR = '一般'
+    GRADE_POOR = '较差'
+
+    def __init__(self, df: pd.DataFrame, column_types: Dict[str, str]):
+        self.df = df
+        self.column_types = column_types
+        self.n_rows = len(df)
+        self.n_cols = len(df.columns)
+
+    def _score_missing(self) -> Dict:
+        """缺失率评分"""
+        total_cells = self.n_rows * self.n_cols
+        missing_cells = self.df.isna().sum().sum()
+        missing_rate = missing_cells / total_cells * 100 if total_cells > 0 else 0
+
+        if missing_rate < 5:
+            score = 100 - missing_rate * 2
+        elif missing_rate < 20:
+            score = 90 - (missing_rate - 5) * 2
+        else:
+            score = max(0, 60 - (missing_rate - 20) * 1.5)
+
+        score = round(max(0, min(100, score)), 2)
+
+        return {
+            'score': score,
+            'missing_rate': round(missing_rate, 2),
+            'missing_cells': int(missing_cells),
+            'total_cells': total_cells,
+        }
+
+    def _score_duplicates(self) -> Dict:
+        """重复行比例评分"""
+        n_duplicates = self.df.duplicated().sum()
+        duplicate_rate = n_duplicates / self.n_rows * 100 if self.n_rows > 0 else 0
+
+        if duplicate_rate < 5:
+            score = 100 - duplicate_rate * 2
+        elif duplicate_rate < 20:
+            score = 90 - (duplicate_rate - 5) * 2
+        else:
+            score = max(0, 60 - (duplicate_rate - 20) * 1.5)
+
+        score = round(max(0, min(100, score)), 2)
+
+        return {
+            'score': score,
+            'duplicate_rate': round(duplicate_rate, 2),
+            'n_duplicates': int(n_duplicates),
+            'n_rows': self.n_rows,
+        }
+
+    def _score_outliers(self) -> Dict:
+        """异常值比例评分（IQR方法）"""
+        numeric_cols = [c for c, t in self.column_types.items() if t == 'numeric']
+        n_numeric = len(numeric_cols)
+
+        if n_numeric == 0:
+            return {
+                'score': 100,
+                'outlier_cols_ratio': 0,
+                'n_outlier_cols': 0,
+                'n_numeric_cols': 0,
+                'per_col_outliers': {},
+            }
+
+        outlier_cols = 0
+        per_col_outliers = {}
+
+        for col in numeric_cols:
+            series = self.df[col].dropna()
+            if len(series) == 0:
+                per_col_outliers[col] = 0
+                continue
+
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+
+            if iqr == 0:
+                per_col_outliers[col] = 0
+                continue
+
+            lower_bound = q1 - 1.5 * iqr
+            upper_bound = q3 + 1.5 * iqr
+
+            n_outliers = ((series < lower_bound) | (series > upper_bound)).sum()
+            outlier_ratio = n_outliers / len(series) * 100
+            per_col_outliers[col] = round(outlier_ratio, 2)
+
+            if outlier_ratio > 10:
+                outlier_cols += 1
+
+        outlier_cols_ratio = outlier_cols / n_numeric * 100
+
+        if outlier_cols_ratio < 10:
+            score = 100 - outlier_cols_ratio * 1
+        elif outlier_cols_ratio < 30:
+            score = 90 - (outlier_cols_ratio - 10) * 1.5
+        else:
+            score = max(0, 60 - (outlier_cols_ratio - 30) * 1)
+
+        score = round(max(0, min(100, score)), 2)
+
+        return {
+            'score': score,
+            'outlier_cols_ratio': round(outlier_cols_ratio, 2),
+            'n_outlier_cols': outlier_cols,
+            'n_numeric_cols': n_numeric,
+            'per_col_outliers': per_col_outliers,
+        }
+
+    def calculate_score(self) -> Dict:
+        """计算综合数据质量评分"""
+        missing_result = self._score_missing()
+        duplicate_result = self._score_duplicates()
+        outlier_result = self._score_outliers()
+
+        overall_score = round(
+            (missing_result['score'] * 0.4 +
+             duplicate_result['score'] * 0.3 +
+             outlier_result['score'] * 0.3),
+            2
+        )
+
+        if overall_score >= 90:
+            grade = self.GRADE_EXCELLENT
+        elif overall_score >= 75:
+            grade = self.GRADE_GOOD
+        elif overall_score >= 60:
+            grade = self.GRADE_FAIR
+        else:
+            grade = self.GRADE_POOR
+
+        return {
+            'overall_score': overall_score,
+            'grade': grade,
+            'missing': missing_result,
+            'duplicates': duplicate_result,
+            'outliers': outlier_result,
+        }

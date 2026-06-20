@@ -163,7 +163,77 @@ def step_data_upload():
 
     st.markdown("---")
 
-    st.subheader("📊 数据概况报告")
+    st.subheader("📊 数据质量评分")
+
+    from src.data_exploration import DataQualityScorer
+
+    scorer = DataQualityScorer(st.session_state.df, st.session_state.column_types)
+    quality_score = scorer.calculate_score()
+
+    grade_colors = {
+        '优秀': 'green',
+        '良好': 'blue',
+        '一般': 'orange',
+        '较差': 'red',
+    }
+    grade_color = grade_colors.get(quality_score['grade'], 'gray')
+
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+    with col1:
+        st.metric(
+            "综合评分",
+            f"{quality_score['overall_score']} 分",
+            f"等级: {quality_score['grade']}",
+        )
+        st.markdown(f"<h4 style='color: {grade_color}; text-align: center;'>数据质量：{quality_score['grade']}</h4>", unsafe_allow_html=True)
+
+        fig, ax = plt.subplots(figsize=(6, 1.5))
+        score = quality_score['overall_score']
+        ax.barh([0], [score], color=grade_color, height=0.5)
+        ax.barh([0], [100 - score], left=[score], color='#eee', height=0.5)
+        ax.set_xlim(0, 100)
+        ax.set_yticks([])
+        ax.set_xticks([0, 60, 75, 90, 100])
+        ax.set_xticklabels(['0', '60', '75', '90', '100'])
+        ax.axvline(x=60, color='red', linestyle='--', linewidth=0.5, alpha=0.5)
+        ax.axvline(x=75, color='orange', linestyle='--', linewidth=0.5, alpha=0.5)
+        ax.axvline(x=90, color='green', linestyle='--', linewidth=0.5, alpha=0.5)
+        ax.text(score, 0, f' {score}', va='center', fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+    with col2:
+        missing = quality_score['missing']
+        st.metric("缺失率评分", f"{missing['score']} 分")
+        st.caption(f"缺失率: {missing['missing_rate']}%")
+        st.caption(f"缺失单元格: {missing['missing_cells']:,}")
+
+    with col3:
+        duplicates = quality_score['duplicates']
+        st.metric("重复行评分", f"{duplicates['score']} 分")
+        st.caption(f"重复率: {duplicates['duplicate_rate']}%")
+        st.caption(f"重复行数: {duplicates['n_duplicates']:,}")
+
+    with col4:
+        outliers = quality_score['outliers']
+        st.metric("异常值评分", f"{outliers['score']} 分")
+        st.caption(f"高异常值列占比: {outliers['outlier_cols_ratio']}%")
+        st.caption(f"异常值列数: {outliers['n_outlier_cols']}/{outliers['n_numeric_cols']}")
+
+    with st.expander("📈 查看各列异常值详情"):
+        if outliers['per_col_outliers']:
+            outlier_df = pd.DataFrame([
+                {'列名': col, '异常值比例(%)': ratio}
+                for col, ratio in outliers['per_col_outliers'].items()
+            ]).sort_values('异常值比例(%)', ascending=False)
+            st.dataframe(outlier_df, use_container_width=True)
+        else:
+            st.info("无数值列可分析")
+
+    st.markdown("---")
+
+    st.subheader("📋 数据概况")
 
     explorer = DataExplorer(st.session_state.df, st.session_state.column_types)
     overview = explorer.get_overview()
@@ -301,6 +371,133 @@ def step_feature_engineering():
 
         with st.expander("📋 查看所有特征名称"):
             st.write(result['feature_names'])
+
+        st.markdown("---")
+        st.subheader("🔍 特征交互探索")
+        st.caption("选择两个特征，查看它们的交互效果及与目标变量的互信息")
+
+        from src.feature_engineering import FeatureInteractionExplorer
+
+        explorer = FeatureInteractionExplorer(
+            st.session_state.df,
+            st.session_state.column_types,
+            st.session_state.target_col
+        )
+
+        available = explorer.get_available_features()
+        all_features = available['numeric'] + available['categorical']
+
+        col1, col2 = st.columns(2)
+        with col1:
+            feat1 = st.selectbox("选择特征1", options=all_features, key='feat1_interaction')
+        with col2:
+            feat2 = st.selectbox("选择特征2", options=[f for f in all_features if f != feat1], key='feat2_interaction')
+
+        if st.button("🔬 分析交互效果", key='analyze_interaction'):
+            with st.spinner("正在分析特征交互..."):
+                interaction = explorer.analyze_interaction(feat1, feat2, st.session_state.task_type)
+
+            if 'error' in interaction:
+                st.error(interaction['error'])
+            else:
+                mi_info = interaction.get('mi_info', {})
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric(f"{feat1} 互信息", f"{mi_info.get('mi_col1', 0):.4f}")
+                with col2:
+                    st.metric(f"{feat2} 互信息", f"{mi_info.get('mi_col2', 0):.4f}")
+                with col3:
+                    st.metric("联合互信息(近似)", f"{mi_info.get('mi_pair', 0):.4f}")
+
+                st.markdown("#### 📊 可视化")
+
+                if interaction['type'] == 'numeric_numeric':
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    x = interaction['plot_data']['x']
+                    y = interaction['plot_data']['y']
+                    sample_size = min(1000, len(x))
+                    indices = np.random.choice(len(x), sample_size, replace=False) if len(x) > sample_size else np.arange(len(x))
+                    ax.scatter(np.array(x)[indices], np.array(y)[indices], alpha=0.6, s=20)
+                    ax.set_xlabel(feat1)
+                    ax.set_ylabel(feat2)
+                    ax.set_title(f"{feat1} vs {feat2} 散点图 (Pearson相关系数: {interaction['correlation']:.4f})")
+                    ax.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+                    st.info(f"**Pearson相关系数**: {interaction['correlation']:.4f}  \n**样本数**: {interaction['n_samples']}")
+
+                elif interaction['type'] == 'numeric_categorical':
+                    num_col = interaction['numeric_col']
+                    cat_col = interaction['categorical_col']
+                    groups = interaction['groups']
+
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    group_data = [g['values'] for g in groups.values()]
+                    group_labels = list(groups.keys())
+                    if len(group_labels) > 10:
+                        top_groups = sorted(groups.items(), key=lambda x: x[1]['count'], reverse=True)[:10]
+                        group_data = [g['values'] for _, g in top_groups]
+                        group_labels = [k for k, _ in top_groups]
+                        st.caption("（仅显示样本数最多的前10个类别）")
+
+                    bp = ax.boxplot(group_data, labels=group_labels, patch_artist=True)
+                    colors = plt.cm.Set2(np.linspace(0, 1, len(group_labels)))
+                    for patch, color in zip(bp['boxes'], colors):
+                        patch.set_facecolor(color)
+                        patch.set_alpha(0.7)
+
+                    ax.set_xlabel(cat_col)
+                    ax.set_ylabel(num_col)
+                    ax.set_title(f"{num_col} 按 {cat_col} 分组箱线图 (F统计量: {interaction['f_statistic']:.4f}, p值: {interaction['p_value']:.4f})")
+                    plt.xticks(rotation=45, ha='right')
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+                    st.info(f"**F统计量**: {interaction['f_statistic']:.4f}  \n**p值**: {interaction['p_value']:.4f}  \n**样本数**: {interaction['n_samples']}")
+
+                    group_df = pd.DataFrame([
+                        {'类别': k, '均值': v['mean'], '中位数': v['median'], '样本数': v['count']}
+                        for k, v in groups.items()
+                    ]).sort_values('样本数', ascending=False)
+                    with st.expander("📋 查看分组统计详情"):
+                        st.dataframe(group_df, use_container_width=True)
+
+                elif interaction['type'] == 'categorical_categorical':
+                    fig, ax = plt.subplots(figsize=(10, 8))
+                    values = np.array(interaction['values'])
+                    index = interaction['index']
+                    columns = interaction['columns']
+
+                    if len(index) > 20 or len(columns) > 20:
+                        st.caption("（类别过多，仅显示部分数据）")
+                        if len(index) > 20:
+                            values = values[:20, :]
+                            index = index[:20]
+                        if len(columns) > 20:
+                            values = values[:, :20]
+                            columns = columns[:20]
+
+                    sns.heatmap(
+                        values,
+                        annot=True,
+                        fmt='d',
+                        cmap='YlOrRd',
+                        ax=ax,
+                        xticklabels=columns,
+                        yticklabels=index,
+                    )
+                    ax.set_xlabel(interaction['col2'])
+                    ax.set_ylabel(interaction['col1'])
+                    ax.set_title(f"{interaction['col1']} × {interaction['col2']} 交叉频次热力图 (卡方: {interaction['chi_square']:.4f}, p值: {interaction['p_value']:.4f})")
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+                    st.info(f"**卡方统计量**: {interaction['chi_square']:.4f}  \n**p值**: {interaction['p_value']:.4f}  \n**样本数**: {interaction['n_samples']}")
 
         if st.button("➡️ 下一步：特征重要性评估", type="primary"):
             st.session_state.current_step = 2
@@ -683,6 +880,80 @@ def step_model_diagnosis():
             except Exception as e:
                 st.info(f"SHAP可视化暂不可用: {str(e)}")
 
+        learning_curve = result.get('learning_curve')
+        if learning_curve:
+            st.markdown("---")
+            st.subheader("📈 学习曲线分析")
+            st.caption("使用不同比例的训练数据进行交叉验证，判断模型欠拟合/过拟合状态")
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("最终训练得分", f"{learning_curve['final_train_score']:.4f}")
+            with col2:
+                st.metric("最终验证得分", f"{learning_curve['final_test_score']:.4f}")
+            with col3:
+                st.metric("训练-验证差距", f"{learning_curve['score_gap']:.4f}")
+
+            status_msgs = []
+            if learning_curve.get('is_underfitting'):
+                status_msgs.append("⚠️ 可能欠拟合")
+            if learning_curve.get('is_overfitting'):
+                status_msgs.append("⚠️ 可能过拟合")
+            if learning_curve.get('needs_more_data'):
+                status_msgs.append("📈 增加数据可能有帮助")
+            if not status_msgs:
+                status_msgs.append("✅ 模型状态良好")
+
+            st.info(" | ".join(status_msgs))
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            train_sizes_pct = [int(s * 100) for s in learning_curve['train_sizes']]
+            train_mean = learning_curve['train_scores_mean']
+            train_std = learning_curve['train_scores_std']
+            test_mean = learning_curve['test_scores_mean']
+            test_std = learning_curve['test_scores_std']
+
+            ax.plot(train_sizes_pct, train_mean, 'o-', color='blue', label='训练集得分', linewidth=2)
+            ax.fill_between(train_sizes_pct,
+                         np.array(train_mean) - np.array(train_std),
+                         np.array(train_mean) + np.array(train_std),
+                         alpha=0.15, color='blue')
+
+            ax.plot(train_sizes_pct, test_mean, 's-', color='orange', label='验证集得分', linewidth=2)
+            ax.fill_between(train_sizes_pct,
+                         np.array(test_mean) - np.array(test_std),
+                         np.array(test_mean) + np.array(test_std),
+                         alpha=0.15, color='orange')
+
+            ax.set_xlabel('训练数据比例 (%)')
+            ax.set_ylabel(f"得分 ({learning_curve.get('scoring', 'score')})")
+            ax.set_title('学习曲线 - 训练集 vs 验证集')
+            ax.legend(loc='best')
+            ax.grid(True, alpha=0.3)
+            all_scores = train_mean + test_mean
+            min_score = min(all_scores)
+            ax.set_ylim([max(0, min_score - 0.1), 1.05])
+
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            st.markdown("#### 💡 分析建议")
+            for suggestion in learning_curve.get('suggestions', []):
+                st.text(f"  • {suggestion}")
+
+            with st.expander("📋 查看详细数据"):
+                lc_df = pd.DataFrame({
+                    '训练比例(%)': train_sizes_pct,
+                    '训练样本数': learning_curve['train_sample_sizes'],
+                    '训练得分': learning_curve['train_scores_mean'],
+                    '训练标准差': learning_curve['train_scores_std'],
+                    '验证得分': learning_curve['test_scores_mean'],
+                    '验证标准差': learning_curve['test_scores_std'],
+                })
+                st.dataframe(lc_df, use_container_width=True)
+
         if st.button("➡️ 下一步：导出Pipeline", type="primary"):
             st.session_state.current_step = 5
             st.rerun()
@@ -732,6 +1003,8 @@ def step_export():
     st.text("  • model.onnx (可选) - ONNX格式模型")
     st.text("  • prediction_api.py - 预测API脚本模板")
     st.text("  • model_card.md - 模型卡文档")
+    st.text("  • feature_stats.json - 训练数据特征统计（用于漂移检测）")
+    st.text("  • drift_detector.py - 数据漂移检测脚本")
 
 
 def main():
