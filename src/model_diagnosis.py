@@ -232,6 +232,7 @@ class ModelDiagnostician:
         y: pd.Series,
         train_sizes: Optional[List[float]] = None,
         cv: int = 5,
+        scoring: Optional[str] = None,
     ) -> Dict:
         """学习曲线分析
 
@@ -244,12 +245,14 @@ class ModelDiagnostician:
             y: 目标变量
             train_sizes: 训练数据比例列表，默认 [0.1, 0.3, 0.5, 0.7, 1.0]
             cv: 交叉验证折数
+            scoring: 评估指标，如 'roc_auc', 'f1_macro', 'r2', 'neg_mean_squared_error' 等
 
         Returns:
             学习曲线分析结果字典
         """
         from sklearn.model_selection import cross_validate, StratifiedKFold, KFold
         from sklearn.base import clone
+        from sklearn.metrics import get_scorer
         import time
 
         if train_sizes is None:
@@ -257,20 +260,32 @@ class ModelDiagnostician:
 
         train_sizes = sorted(train_sizes)
 
+        if scoring is None:
+            if self.task_type == 'binary':
+                scoring = 'roc_auc'
+            elif self.task_type == 'multiclass':
+                scoring = 'f1_macro'
+            else:
+                scoring = 'r2'
+
         if self.task_type in ['binary', 'multiclass']:
             cv_splitter = StratifiedKFold(
                 n_splits=cv,
                 shuffle=True,
                 random_state=self.random_state
             )
-            scoring = 'accuracy'
         else:
             cv_splitter = KFold(
                 n_splits=cv,
                 shuffle=True,
                 random_state=self.random_state
             )
-            scoring = 'r2'
+
+        try:
+            scorer = get_scorer(scoring)
+        except Exception:
+            scorer = get_scorer('accuracy' if self.task_type in ['binary', 'multiclass'] else 'r2')
+            scoring = 'accuracy' if self.task_type in ['binary', 'multiclass'] else 'r2'
 
         train_scores_mean = []
         train_scores_std = []
@@ -280,6 +295,8 @@ class ModelDiagnostician:
 
         X_arr = X.values if isinstance(X, pd.DataFrame) else X
         y_arr = y.values if isinstance(y, pd.Series) else y
+
+        rng = np.random.RandomState(self.random_state)
 
         for train_size in train_sizes:
             n_samples = int(len(X_arr) * train_size)
@@ -301,7 +318,7 @@ class ModelDiagnostician:
                     n_train_use = max(n_train_use, 10)
                     n_train_use = min(n_train_use, len(X_train_fold))
 
-                    indices = np.random.choice(
+                    indices = rng.choice(
                         len(X_train_fold),
                         size=n_train_use,
                         replace=False
@@ -313,8 +330,8 @@ class ModelDiagnostician:
                     model_clone = clone(model)
                     model_clone.fit(X_train_sub, y_train_sub)
 
-                    train_score = model_clone.score(X_train_sub, y_train_sub)
-                    test_score = model_clone.score(X_test_fold, y_test_fold)
+                    train_score = scorer(model_clone, X_train_sub, y_train_sub)
+                    test_score = scorer(model_clone, X_test_fold, y_test_fold)
 
                     fold_train_scores.append(train_score)
                     fold_test_scores.append(test_score)
@@ -334,11 +351,21 @@ class ModelDiagnostician:
         test_score_increase = test_scores_mean[-1] - test_scores_mean[0]
         train_score_increase = train_scores_mean[-1] - train_scores_mean[0]
 
-        is_underfitting = score_gap < 0.05 and final_test_score < 0.7
-        is_overfitting = score_gap > 0.1 and final_train_score > 0.85
-        needs_more_data = (test_scores_mean[-1] > test_scores_mean[-2]) and (
-            test_scores_mean[-1] - test_scores_mean[0] > 0.05
-        )
+        is_lower_better = scoring.startswith('neg_') or 'error' in scoring or 'loss' in scoring
+
+        if is_lower_better:
+            score_gap_abs = abs(score_gap)
+            is_underfitting = score_gap_abs < 0.05 and final_test_score < -0.5
+            is_overfitting = score_gap_abs > 0.1
+            needs_more_data = (test_scores_mean[-1] > test_scores_mean[-2]) and (
+                test_score_increase > 0.05
+            )
+        else:
+            is_underfitting = score_gap < 0.05 and final_test_score < 0.7
+            is_overfitting = score_gap > 0.1 and final_train_score > 0.85
+            needs_more_data = (test_scores_mean[-1] > test_scores_mean[-2]) and (
+                test_score_increase > 0.05
+            )
 
         suggestions = []
         if is_underfitting:

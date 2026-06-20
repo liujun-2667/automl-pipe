@@ -487,6 +487,7 @@ if __name__ == "__main__":
         ]
 
         stats['numeric'] = {}
+        rng = np.random.RandomState(42)
         for col in numeric_cols:
             series = X[col].dropna()
             if len(series) > 0:
@@ -508,6 +509,14 @@ if __name__ == "__main__":
                 except Exception:
                     col_stats['skewness'] = 0.0
                     col_stats['kurtosis'] = 0.0
+
+                sample_size = min(len(series), 2000)
+                if len(series) > sample_size:
+                    sample_idx = rng.choice(len(series), size=sample_size, replace=False)
+                    col_stats['sample_values'] = series.values[sample_idx].tolist()
+                else:
+                    col_stats['sample_values'] = series.values.tolist()
+
                 stats['numeric'][col] = col_stats
 
         stats['categorical'] = {}
@@ -649,14 +658,35 @@ class FeatureDriftDetector:
                 ref_mean = ref_stat.get('mean', 0)
                 ref_std = ref_stat.get('std', 1) or 1
 
-                ref_samples = np.random.normal(
-                    ref_mean, ref_std,
-                    size=max(len(new_series), 1000)
-                )
+                ref_samples = np.array(ref_stat.get('sample_values', []))
+
+                if len(ref_samples) < 2:
+                    rng = np.random.RandomState(42)
+                    ref_samples = rng.normal(
+                        ref_mean, ref_std,
+                        size=max(len(new_series), 1000)
+                    )
+
+                new_values = new_series.values
+
+                n_use = min(len(ref_samples), len(new_values))
+                if len(ref_samples) > n_use:
+                    rng = np.random.RandomState(42)
+                    ref_idx = rng.choice(len(ref_samples), size=n_use, replace=False)
+                    ref_samples_use = ref_samples[ref_idx]
+                else:
+                    ref_samples_use = ref_samples
+
+                if len(new_values) > n_use:
+                    rng = np.random.RandomState(42)
+                    new_idx = rng.choice(len(new_values), size=n_use, replace=False)
+                    new_values_use = new_values[new_idx]
+                else:
+                    new_values_use = new_values
 
                 ks_stat, p_value = stats.ks_2samp(
-                    ref_samples,
-                    new_series.values
+                    ref_samples_use,
+                    new_values_use
                 )
 
                 drift_detected = p_value < self.p_threshold

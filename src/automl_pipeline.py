@@ -248,8 +248,15 @@ class AutoMLPipeline:
 
         shap_data = self.diagnostician.get_shap_values(best_model, X)
 
+        if self.task_type == 'binary':
+            lc_scoring = 'roc_auc'
+        elif self.task_type == 'multiclass':
+            lc_scoring = 'f1_macro'
+        else:
+            lc_scoring = 'neg_root_mean_squared_error'
+
         learning_curve_data = self.diagnostician.learning_curve_analysis(
-            best_model, X, y, cv=3
+            best_model, X, y, cv=3, scoring=lc_scoring
         )
 
         return {

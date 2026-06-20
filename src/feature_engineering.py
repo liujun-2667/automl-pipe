@@ -759,14 +759,76 @@ class FeatureInteractionExplorer:
             return self._mutual_info_regression(feature, target)
 
     def calculate_pair_mutual_info(self, col1: str, col2: str, task_type: str = 'binary') -> Dict:
-        """计算特征对与目标变量的联合互信息（近似）"""
+        """计算特征对与目标变量的联合互信息 I(X1,X2;Y) = H(Y) - H(Y|X1,X2)"""
         if self.target_col is None or self.target_col not in self.df.columns:
             return {'mi_col1': 0.0, 'mi_col2': 0.0, 'mi_pair': 0.0}
 
         mi_col1 = self.calculate_mutual_info(col1, task_type)
         mi_col2 = self.calculate_mutual_info(col2, task_type)
 
-        mi_pair = round(mi_col1 + mi_col2, 4)
+        df_clean = self.df[[col1, col2, self.target_col]].dropna()
+        if len(df_clean) < 2:
+            return {'mi_col1': mi_col1, 'mi_col2': mi_col2, 'mi_pair': 0.0}
+
+        type1 = self.column_types.get(col1, 'numeric')
+        type2 = self.column_types.get(col2, 'numeric')
+
+        try:
+            from scipy.stats import entropy
+
+            target = df_clean[self.target_col]
+
+            if type1 == 'numeric':
+                x1 = pd.qcut(df_clean[col1], q=min(10, len(df_clean[col1].unique())),
+                             labels=False, duplicates='drop')
+            else:
+                x1 = df_clean[col1].astype('category').cat.codes
+
+            if type2 == 'numeric':
+                x2 = pd.qcut(df_clean[col2], q=min(10, len(df_clean[col2].unique())),
+                             labels=False, duplicates='drop')
+            else:
+                x2 = df_clean[col2].astype('category').cat.codes
+
+            if task_type in ['binary', 'multiclass']:
+                y = target.astype('category').cat.codes
+            else:
+                y = pd.qcut(target, q=min(10, len(target.unique())),
+                            labels=False, duplicates='drop')
+
+            df_temp = pd.DataFrame({'x1': x1, 'x2': x2, 'y': y})
+            df_temp = df_temp.dropna()
+
+            if len(df_temp) < 2:
+                return {'mi_col1': mi_col1, 'mi_col2': mi_col2, 'mi_pair': max(mi_col1, mi_col2)}
+
+            y = df_temp['y'].values
+            x1 = df_temp['x1'].values
+            x2 = df_temp['x2'].values
+
+            _, y_counts = np.unique(y, return_counts=True)
+            h_y = entropy(y_counts, base=2)
+
+            joint_xy = pd.DataFrame({'x1': x1, 'x2': x2, 'y': y})
+            grouped = joint_xy.groupby(['x1', 'x2'])['y']
+
+            h_y_given_x1x2 = 0.0
+            total_count = len(joint_xy)
+
+            for (x1_val, x2_val), group in grouped:
+                group_count = len(group)
+                if group_count == 0:
+                    continue
+                _, y_group_counts = np.unique(group.values, return_counts=True)
+                p_x1x2 = group_count / total_count
+                h_y_given_x1x2 += p_x1x2 * entropy(y_group_counts, base=2)
+
+            mi_pair = h_y - h_y_given_x1x2
+            mi_pair = max(0.0, mi_pair)
+            mi_pair = round(float(mi_pair), 4)
+
+        except Exception as e:
+            mi_pair = round(float(max(mi_col1, mi_col2)), 4)
 
         return {
             'mi_col1': mi_col1,
