@@ -241,6 +241,7 @@ class DateFeatureExtractor(BaseEstimator, TransformerMixin):
                     f"{col}_day",
                     f"{col}_dayofweek",
                     f"{col}_is_weekend",
+                    f"{col}_days_since_today",
                     f"{col}_quarter",
                 ])
         return self
@@ -249,6 +250,7 @@ class DateFeatureExtractor(BaseEstimator, TransformerMixin):
         if isinstance(X, pd.DataFrame):
             features = []
             feature_names = []
+            today = pd.Timestamp.today().normalize()
             for col in X.columns:
                 dt_series = pd.to_datetime(X[col], errors='coerce')
                 col_features = pd.DataFrame({
@@ -257,6 +259,7 @@ class DateFeatureExtractor(BaseEstimator, TransformerMixin):
                     f"{col}_day": dt_series.dt.day,
                     f"{col}_dayofweek": dt_series.dt.dayofweek,
                     f"{col}_is_weekend": (dt_series.dt.dayofweek >= 5).astype(int),
+                    f"{col}_days_since_today": (today - dt_series.dt.normalize()).dt.days,
                     f"{col}_quarter": dt_series.dt.quarter,
                 })
                 features.append(col_features)

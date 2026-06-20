@@ -484,6 +484,12 @@ class AutoModelSelector:
 
         return df
 
+    def get_best_score(self) -> float:
+        """获取最佳模型得分（对外展示：回归为正RMSE）"""
+        if self.task_type == 'regression':
+            return -self.best_score_
+        return self.best_score_
+
     def get_best_model(self):
         """获取最佳模型"""
         return self.best_model_
@@ -494,4 +500,7 @@ class AutoModelSelector:
 
     def get_progress(self) -> Dict:
         """获取当前进度"""
-        return self.trial_progress.copy()
+        progress = self.trial_progress.copy()
+        if self.task_type == 'regression' and progress.get('current_best_score', 0) != 0:
+            progress['current_best_score'] = -progress['current_best_score']
+        return progress

@@ -100,12 +100,19 @@ class FeatureImportanceAnalyzer:
         model = self._get_model_for_rf()
         model.fit(X, y)
 
+        if self.task_type == 'binary':
+            scoring = 'roc_auc'
+        elif self.task_type == 'multiclass':
+            scoring = 'f1_macro'
+        else:
+            scoring = 'neg_mean_squared_error'
+
         result = permutation_importance(
             model, X, y,
             n_repeats=5,
             random_state=self.random_state,
             n_jobs=-1,
-            scoring='roc_auc' if self.task_type in ['binary', 'multiclass'] else 'neg_mean_squared_error'
+            scoring=scoring
         )
 
         importance = pd.Series(

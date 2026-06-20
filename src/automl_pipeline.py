@@ -224,7 +224,7 @@ class AutoMLPipeline:
         return {
             'results_df': results_df,
             'best_model_name': self.model_selector.get_best_model_name(),
-            'best_score': self.model_selector.best_score_,
+            'best_score': self.model_selector.get_best_score(),
             'best_model': self.model_selector.get_best_model(),
         }
 
