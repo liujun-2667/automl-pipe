@@ -277,6 +277,11 @@ class AutoMLPipeline:
         best_model_name = self.model_selector.get_best_model_name() if self.model_selector else 'Unknown'
         feature_names = list(X.columns) if X is not None else []
 
+        all_models = None
+        if self.model_selector:
+            top_models_raw = self.model_selector.get_top_models(n=3)
+            all_models = [(name, model) for name, model, _ in top_models_raw]
+
         self.interpretability_analyzer = ModelInterpretabilityAnalyzer(
             model=best_model,
             X=X,
@@ -286,6 +291,7 @@ class AutoMLPipeline:
             feature_names=feature_names,
             column_types=self.column_types,
             random_state=self.random_state,
+            all_models=all_models,
         )
 
         result = self.interpretability_analyzer.run_full_analysis(output_dir=output_dir)

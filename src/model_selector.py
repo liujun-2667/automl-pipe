@@ -504,3 +504,27 @@ class AutoModelSelector:
         if self.task_type == 'regression' and progress.get('current_best_score', 0) != 0:
             progress['current_best_score'] = -progress['current_best_score']
         return progress
+
+    def get_top_models(self, n: int = 3) -> List[Tuple[str, Any, float]]:
+        """获取TOP-N模型列表
+
+        Args:
+            n: 要获取的模型数量
+
+        Returns:
+            [(model_name, model_instance, cv_score), ...]，按得分降序排列
+        """
+        if not self.results_:
+            return []
+
+        df = self.get_results_df()
+        top_results = df.head(n)
+
+        top_models = []
+        for _, row in top_results.iterrows():
+            model_name = row['model_name']
+            if model_name in self.models_:
+                score = row['cv_mean']
+                top_models.append((model_name, self.models_[model_name], float(score)))
+
+        return top_models

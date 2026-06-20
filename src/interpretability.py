@@ -77,16 +77,33 @@ class LocalInterpreter:
             X_sample = self.X.iloc[[sample_idx]]
             shap_values = self._shap_explainer.shap_values(X_sample)
 
-            if isinstance(shap_values, list):
+            # 处理不同的 SHAP 返回格式
+            # 旧版本: list of arrays [class0_shap, class1_shap]
+            # 新版本 SHAP 0.52+: 3D array (n_samples, n_features, n_classes)
+            if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+                # 新版本: (1, n_features, n_classes)，取正类的 shap values
+                n_classes = shap_values.shape[2]
+                if n_classes > 1:
+                    shap_values = shap_values[0, :, 1]  # 取正类
+                else:
+                    shap_values = shap_values[0, :, 0]
+            elif isinstance(shap_values, list):
+                # 旧版本: 列表格式
                 shap_values = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+                shap_values = shap_values[0] if shap_values.ndim > 1 else shap_values
+            elif shap_values.ndim > 1:
+                shap_values = shap_values[0]
 
-            shap_values = shap_values[0] if shap_values.ndim > 1 else shap_values
+            shap_values = np.asarray(shap_values).flatten()
 
             base_value = None
             if hasattr(self._shap_explainer, 'expected_value'):
                 base_value = self._shap_explainer.expected_value
                 if isinstance(base_value, (list, np.ndarray)):
-                    base_value = base_value[1] if len(base_value) > 1 else base_value[0]
+                    if len(base_value) > 1:
+                        base_value = base_value[1]  # 取正类
+                    else:
+                        base_value = base_value[0]
 
             feature_contribs = []
             for i, feat in enumerate(self.feature_names):
@@ -257,6 +274,128 @@ class LocalInterpreter:
             'label': '解释冲突' if is_conflict else '解释一致',
         }
 
+    def explain_compare(self, sample_idx1: int, sample_idx2: int) -> Dict:
+        """对比两个样本的解释结果，分析决策差异
+
+        Args:
+            sample_idx1: 第一个样本索引（通常为正例）
+            sample_idx2: 第二个样本索引（通常为反例）
+
+        Returns:
+            包含两个样本的完整解释结果和决策差异分析
+        """
+        try:
+            shap1 = self.explain_shap(sample_idx1)
+            lime1 = self.explain_lime(sample_idx1)
+            ice1 = self.explain_ice(sample_idx1)
+
+            shap2 = self.explain_shap(sample_idx2)
+            lime2 = self.explain_lime(sample_idx2)
+            ice2 = self.explain_ice(sample_idx2)
+
+            # 计算预测值
+            X1 = self.X.iloc[[sample_idx1]]
+            X2 = self.X.iloc[[sample_idx2]]
+            pred1 = float(self.model.predict(X1)[0])
+            pred2 = float(self.model.predict(X2)[0])
+            has_proba = hasattr(self.model, 'predict_proba')
+            if has_proba:
+                pred1 = float(self.model.predict_proba(X1)[0][1])
+                pred2 = float(self.model.predict_proba(X2)[0][1])
+
+            # 计算一致性评分（即使某些explainer失败）
+            consistency1 = 0.0
+            consistency2 = 0.0
+            if 'error' not in shap1 and 'error' not in lime1 and 'error' not in ice1:
+                consistency1 = self.compute_consistency_score(shap1, lime1, ice1).get('mean_consistency', 0.0)
+            if 'error' not in shap2 and 'error' not in lime2 and 'error' not in ice2:
+                consistency2 = self.compute_consistency_score(shap2, lime2, ice2).get('mean_consistency', 0.0)
+
+            # 决策差异分析（至少需要SHAP）
+            decision_diff = None
+            if 'error' not in shap1 and 'error' not in shap2:
+                decision_diff = self._analyze_decision_difference(shap1, shap2, lime1, lime2)
+
+            return {
+                'sample1': {
+                    'idx': sample_idx1,
+                    'prediction': pred1,
+                    'shap': shap1,
+                    'lime': lime1,
+                    'ice': ice1,
+                    'consistency_score': consistency1,
+                },
+                'sample2': {
+                    'idx': sample_idx2,
+                    'prediction': pred2,
+                    'shap': shap2,
+                    'lime': lime2,
+                    'ice': ice2,
+                    'consistency_score': consistency2,
+                },
+                'decision_difference': decision_diff,
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _analyze_decision_difference(self, shap1: Dict, shap2: Dict,
+                                     lime1: Dict, lime2: Dict) -> Dict:
+        """分析两个样本间的决策差异，找出贡献方向相反的特征"""
+        try:
+            shap_contribs1 = {c['feature']: c['shap_value'] for c in shap1.get('feature_contributions', [])}
+            shap_contribs2 = {c['feature']: c['shap_value'] for c in shap2.get('feature_contributions', [])}
+
+            lime_weights1 = {}
+            for w in lime1.get('feature_weights', []):
+                feat = w['feature']
+                for fn in self.feature_names:
+                    if fn in feat:
+                        lime_weights1[fn] = w['weight']
+                        break
+
+            lime_weights2 = {}
+            for w in lime2.get('feature_weights', []):
+                feat = w['feature']
+                for fn in self.feature_names:
+                    if fn in feat:
+                        lime_weights2[fn] = w['weight']
+                        break
+
+            opposite_features = []
+            all_features = list(set(list(shap_contribs1.keys()) + list(shap_contribs2.keys())))
+
+            for feat in all_features:
+                s1 = shap_contribs1.get(feat, 0)
+                s2 = shap_contribs2.get(feat, 0)
+
+                if (s1 > 0 and s2 < 0) or (s1 < 0 and s2 > 0):
+                    diff_abs = abs(s1 - s2)
+                    opposite_features.append({
+                        'feature': feat,
+                        'sample1_shap': float(s1),
+                        'sample2_shap': float(s2),
+                        'sample1_lime': float(lime_weights1.get(feat, 0)),
+                        'sample2_lime': float(lime_weights2.get(feat, 0)),
+                        'diff_abs': float(diff_abs),
+                        'direction': '正→负' if s1 > 0 else '负→正',
+                    })
+
+            opposite_features.sort(key=lambda x: x['diff_abs'], reverse=True)
+
+            pred1 = shap1.get('prediction', 0)
+            pred2 = shap2.get('prediction', 0)
+
+            return {
+                'prediction_diff': float(abs(pred1 - pred2)),
+                'prediction_sample1': float(pred1),
+                'prediction_sample2': float(pred2),
+                'n_opposite_features': len(opposite_features),
+                'opposite_features': opposite_features,
+                'summary': f"两个样本预测值差异为 {abs(pred1 - pred2):.4f}，共发现 {len(opposite_features)} 个贡献方向相反的特征",
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
 
 class GlobalInterpreter:
     """全局解释器：对整个验证集进行聚合分析"""
@@ -297,7 +436,16 @@ class GlobalInterpreter:
             except Exception:
                 return {'error': 'Could not compute SHAP values'}
 
-            if isinstance(shap_values, list):
+            # 处理不同的 SHAP 返回格式
+            if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+                # 新版本 SHAP 0.52+: (n_samples, n_features, n_classes)
+                n_classes = shap_values.shape[2]
+                if n_classes > 1:
+                    shap_values = shap_values[:, :, 1]  # 取正类
+                else:
+                    shap_values = shap_values[:, :, 0]
+            elif isinstance(shap_values, list):
+                # 旧版本: 列表格式
                 shap_values = shap_values[1] if len(shap_values) > 1 else shap_values[0]
 
             mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
@@ -379,7 +527,7 @@ class GlobalInterpreter:
 
             return {
                 'feature': feature,
-                'grid_values': pdp_result['values'][0].tolist(),
+                'grid_values': pdp_result['grid_values'][0].tolist(),
                 'partial_dependence': pdp_result['average'][0].tolist(),
                 'individual': pdp_result['individual'].tolist() if 'individual' in pdp_result else [],
             }
@@ -401,8 +549,8 @@ class GlobalInterpreter:
                 method='brute',
             )
 
-            grid1 = pdp_result['values'][0]
-            grid2 = pdp_result['values'][1]
+            grid1 = pdp_result['grid_values'][0]
+            grid2 = pdp_result['grid_values'][1]
             z_values = pdp_result['average'][0]
 
             return {
@@ -411,6 +559,60 @@ class GlobalInterpreter:
                 'grid_x': grid1.tolist(),
                 'grid_y': grid2.tolist(),
                 'z_values': z_values.tolist(),
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    def compute_pdp_multi(self, feature: str, models: List[Tuple[str, Any]],
+                          grid_resolution: int = 30) -> Dict:
+        """同时计算多个模型的一维PDP，用于对比不同模型的偏依赖模式
+
+        Args:
+            feature: 要分析的特征名
+            models: [(model_name, model_instance), ...] 模型列表
+            grid_resolution: 网格分辨率
+
+        Returns:
+            包含各模型PDP结果的字典
+        """
+        try:
+            if feature not in self.X.columns:
+                return {'error': f'Feature {feature} not found'}
+
+            if not pd.api.types.is_numeric_dtype(self.X[feature]):
+                return {'error': f'Feature {feature} is not numeric'}
+
+            if not models:
+                return {'error': 'No models provided'}
+
+            results = []
+            errors = []
+            for model_name, model in models:
+                try:
+                    pdp_result = partial_dependence(
+                        model, self.X, features=[feature],
+                        grid_resolution=grid_resolution,
+                        method='brute',
+                    )
+                    pdp_vals = pdp_result['average'][0]
+                    results.append({
+                        'model_name': model_name,
+                        'grid_values': pdp_result['grid_values'][0].tolist(),
+                        'partial_dependence': pdp_vals.tolist(),
+                        'pdp_values': pdp_vals,
+                    })
+                except Exception as e:
+                    errors.append(f"{model_name}: {str(e)}")
+                    continue
+
+            if not results:
+                return {'error': f'All models failed to compute PDP. Errors: {"; ".join(errors)}'}
+
+            return {
+                'feature': feature,
+                'n_models': len(results),
+                'model_results': results,
+                'grid_values_common': results[0]['grid_values'] if results else [],
             }
         except Exception as e:
             return {'error': str(e)}
@@ -487,7 +689,117 @@ class AdversarialExplainer:
 
         return sample
 
-    def detect_sensitivity(self, sample_idx: int) -> Dict:
+    def _perturb_single_feature(self, sample_idx: int, feature: str) -> pd.DataFrame:
+        """仅对单个特征进行扰动，其他特征保持不变"""
+        sample = self.X.iloc[[sample_idx]].copy()
+
+        if feature not in sample.columns:
+            return sample
+
+        col_type = self.column_types.get(feature, '')
+        series = self.X[feature]
+
+        if pd.api.types.is_numeric_dtype(series) or col_type == 'numeric':
+            feat_std = series.std()
+            if feat_std > 0 and not np.isnan(feat_std):
+                perturbation = self.rng.normal(0, 0.5 * feat_std)
+                sample[feature] = sample[feature].values[0] + perturbation
+        else:
+            value_counts = series.value_counts()
+            if len(value_counts) >= 2:
+                current_val = sample[feature].values[0]
+                other_vals = [v for v in value_counts.index if v != current_val]
+                if other_vals:
+                    sample[feature] = other_vals[0]
+
+        return sample
+
+    def trace_attribution_path(self, sample_idx: int, original_shap: Dict) -> Dict:
+        """追踪是哪个特征的扰动导致了解释排序变化最大
+
+        Args:
+            sample_idx: 样本索引
+            original_shap: 原始样本的SHAP解释结果
+
+        Returns:
+            包含归因不稳定特征的字典
+        """
+        try:
+            if 'error' in original_shap or 'top_features' not in original_shap:
+                return {'error': 'Invalid original SHAP result'}
+
+            original_rank = original_shap['top_features']
+
+            def top3_kendall(rank1: List[str], rank2: List[str]) -> float:
+                all_feats = list(set(rank1[:3] + rank2[:3]))
+                if len(all_feats) < 2:
+                    return 1.0
+                r1 = [rank1.index(f) if f in rank1 else len(rank1) for f in all_feats]
+                r2 = [rank2.index(f) if f in rank2 else len(rank2) for f in all_feats]
+                try:
+                    tau, _ = kendalltau(r1, r2)
+                    return float(tau) if not np.isnan(tau) else 0.0
+                except Exception:
+                    return 0.0
+
+            base_tau = 1.0
+            tau_drops = []
+
+            for feat in self.feature_names:
+                try:
+                    perturbed_sample = self._perturb_single_feature(sample_idx, feat)
+                    X_with_perturbed = pd.concat([self.X, perturbed_sample], ignore_index=True)
+                    perturbed_idx = len(X_with_perturbed) - 1
+
+                    perturbed_interpreter = LocalInterpreter(
+                        self.model, X_with_perturbed, self.task_type,
+                        self.feature_names, self.random_state
+                    )
+
+                    perturbed_shap = perturbed_interpreter.explain_shap(perturbed_idx)
+
+                    if 'error' in perturbed_shap or 'top_features' not in perturbed_shap:
+                        continue
+
+                    perturbed_rank = perturbed_shap['top_features']
+                    tau = top3_kendall(original_rank, perturbed_rank)
+                    tau_drop = base_tau - tau
+
+                    tau_drops.append({
+                        'feature': feat,
+                        'tau_after_perturb': float(tau),
+                        'tau_drop': float(tau_drop),
+                    })
+                except Exception:
+                    continue
+
+            if not tau_drops:
+                return {
+                    'trigger_feature': None,
+                    'unstable_feature': None,
+                    'original_tau': base_tau,
+                    'min_tau': base_tau,
+                    'max_tau_drop': 0.0,
+                    'feature_tau_drops': {},
+                }
+
+            tau_drops.sort(key=lambda x: x['tau_drop'], reverse=True)
+            max_drop = tau_drops[0]
+            min_tau = min(d['tau_after_perturb'] for d in tau_drops)
+            feat_drops_dict = {d['feature']: d['tau_drop'] for d in tau_drops}
+
+            return {
+                'trigger_feature': max_drop['feature'],
+                'unstable_feature': max_drop['feature'],
+                'original_tau': base_tau,
+                'min_tau': float(min_tau),
+                'max_tau_drop': float(max_drop['tau_drop']),
+                'feature_tau_drops': feat_drops_dict,
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    def detect_sensitivity(self, sample_idx: int, enable_attribution_path: bool = True) -> Dict:
         try:
             original_shap = self.local_interpreter.explain_shap(sample_idx)
             original_lime = self.local_interpreter.explain_lime(sample_idx)
@@ -511,11 +823,16 @@ class AdversarialExplainer:
             if 'error' in perturbed_shap or 'error' in perturbed_lime or 'error' in perturbed_ice:
                 return {'error': 'One or more explainers failed on perturbed sample'}
 
+            attribution_path = None
+            if enable_attribution_path:
+                attribution_path = self.trace_attribution_path(sample_idx, original_shap)
+
             return self._compute_sensitivity_result(
                 sample_idx,
                 original_shap, original_lime, original_ice,
                 perturbed_shap, perturbed_lime, perturbed_ice,
                 perturbed_sample,
+                attribution_path=attribution_path,
             )
         except Exception as e:
             return {'error': str(e)}
@@ -525,6 +842,7 @@ class AdversarialExplainer:
         original_shap: Dict, original_lime: Dict, original_ice: Dict,
         perturbed_shap: Dict, perturbed_lime: Dict, perturbed_ice: Dict,
         perturbed_sample: pd.DataFrame,
+        attribution_path: Optional[Dict] = None,
     ) -> Dict:
         def top3_kendall(rank1: List[str], rank2: List[str]) -> float:
             all_feats = list(set(rank1[:3] + rank2[:3]))
@@ -551,6 +869,12 @@ class AdversarialExplainer:
         perturbed_pred = float(self.model.predict(perturbed_sample)[0])
         prediction_change = abs(original_pred - perturbed_pred)
 
+        trigger_feature = None
+        max_tau_drop = 0.0
+        if attribution_path and 'unstable_feature' in attribution_path:
+            trigger_feature = attribution_path['unstable_feature']
+            max_tau_drop = attribution_path.get('max_tau_drop', 0.0)
+
         return {
             'sample_idx': sample_idx,
             'is_sensitive': is_sensitive,
@@ -562,6 +886,9 @@ class AdversarialExplainer:
             'original_prediction': original_pred,
             'perturbed_prediction': perturbed_pred,
             'prediction_change': float(prediction_change),
+            'trigger_feature': trigger_feature,
+            'max_tau_drop': float(max_tau_drop),
+            'attribution_path': attribution_path,
             'original_top3': {
                 'shap': original_shap['top_features'][:3],
                 'lime': original_lime['top_features'][:3],
@@ -574,7 +901,8 @@ class AdversarialExplainer:
             },
         }
 
-    def batch_detect(self, sample_indices: Optional[List[int]] = None, n_samples: int = 10) -> Dict:
+    def batch_detect(self, sample_indices: Optional[List[int]] = None, n_samples: int = 10,
+                     enable_attribution_path: bool = True) -> Dict:
         if sample_indices is None:
             if len(self.X) <= n_samples:
                 sample_indices = list(range(len(self.X)))
@@ -623,11 +951,16 @@ class AdversarialExplainer:
 
                 perturbed_sample = perturbed_samples_list[i]
 
+                attribution_path = None
+                if enable_attribution_path:
+                    attribution_path = self.trace_attribution_path(idx, original_shap)
+
                 result = self._compute_sensitivity_result(
                     idx,
                     original_shap, original_lime, original_ice,
                     perturbed_shap, perturbed_lime, perturbed_ice,
                     perturbed_sample,
+                    attribution_path=attribution_path,
                 )
                 results.append(result)
             except Exception:
@@ -652,7 +985,8 @@ class InterpretabilityReportExporter:
     def __init__(self, model, X: pd.DataFrame, y: pd.Series,
                  task_type: str = 'binary', model_name: str = 'Unknown',
                  feature_names: Optional[List[str]] = None,
-                 column_types: Optional[Dict] = None, random_state: int = 42):
+                 column_types: Optional[Dict] = None, random_state: int = 42,
+                 all_models: Optional[List[Tuple[str, Any]]] = None):
         self.model = model
         self.X = X
         self.y = y
@@ -663,11 +997,125 @@ class InterpretabilityReportExporter:
         self.random_state = random_state
         self.rng = np.random.RandomState(random_state)
 
+        if all_models is None:
+            self.all_models = [(model_name, model)]
+        else:
+            self.all_models = all_models
+
         self.local_interpreter = LocalInterpreter(model, X, task_type, self.feature_names, random_state)
         self.global_interpreter = GlobalInterpreter(model, X, y, task_type, self.feature_names, random_state)
         self.adversarial_explainer = AdversarialExplainer(
             model, X, task_type, self.feature_names, column_types, random_state
         )
+
+    def compute_model_consistency(self, n_samples: int = 5) -> Dict:
+        """计算多个模型间的解释一致性
+
+        Args:
+            n_samples: 用于计算一致性的随机样本数
+
+        Returns:
+            包含模型间一致性矩阵和热力图数据的字典
+        """
+        try:
+            if len(self.all_models) < 2:
+                return {'error': 'Need at least 2 models for consistency comparison'}
+
+            n_samples = min(n_samples, len(self.X))
+            sample_indices = self.rng.choice(len(self.X), size=n_samples, replace=False).tolist()
+
+            model_rankings = {}
+
+            for model_name, model in self.all_models:
+                try:
+                    local_interp = LocalInterpreter(
+                        model, self.X, self.task_type, self.feature_names, self.random_state
+                    )
+
+                    feature_importances = np.zeros(len(self.feature_names))
+
+                    for idx in sample_indices:
+                        shap_res = local_interp.explain_shap(idx)
+                        if 'error' in shap_res or 'feature_contributions' not in shap_res:
+                            continue
+
+                        for contrib in shap_res['feature_contributions']:
+                            feat = contrib['feature']
+                            if feat in self.feature_names:
+                                feat_idx = self.feature_names.index(feat)
+                                feature_importances[feat_idx] += abs(contrib['shap_value'])
+
+                    avg_importance = feature_importances / max(len(sample_indices), 1)
+                    sorted_indices = np.argsort(-avg_importance)
+                    ranking = [self.feature_names[i] for i in sorted_indices]
+
+                    model_rankings[model_name] = ranking
+                except Exception:
+                    continue
+
+            if len(model_rankings) < 2:
+                return {'error': 'Failed to compute rankings for enough models'}
+
+            model_names = list(model_rankings.keys())
+            n_models = len(model_names)
+
+            consistency_matrix = np.zeros((n_models, n_models))
+            low_consistency_pairs = []
+
+            for i in range(n_models):
+                for j in range(n_models):
+                    if i == j:
+                        consistency_matrix[i, j] = 1.0
+                    elif i < j:
+                        rank1 = model_rankings[model_names[i]]
+                        rank2 = model_rankings[model_names[j]]
+
+                        all_feats = list(set(rank1[:10] + rank2[:10]))
+                        if len(all_feats) < 2:
+                            tau = 1.0
+                        else:
+                            r1 = [rank1.index(f) if f in rank1 else len(rank1) for f in all_feats]
+                            r2 = [rank2.index(f) if f in rank2 else len(rank2) for f in all_feats]
+                            try:
+                                tau, _ = kendalltau(r1, r2)
+                                tau = float(tau) if not np.isnan(tau) else 0.0
+                            except Exception:
+                                tau = 0.0
+
+                        consistency_matrix[i, j] = tau
+                        consistency_matrix[j, i] = tau
+
+                        if tau < 0.4:
+                            low_consistency_pairs.append({
+                                'model1': model_names[i],
+                                'model2': model_names[j],
+                                'kendall_tau': float(tau),
+                                'is_divergent': True,
+                            })
+
+            # 转换为标准格式，找出最低一致性对
+            avg_consistency = float(np.mean(consistency_matrix[np.triu_indices(n_models, k=1)])) if n_models > 1 else 0.0
+
+            min_tau = 1.0
+            lowest_pair = (None, None)
+            for i in range(n_models):
+                for j in range(i + 1, n_models):
+                    if consistency_matrix[i, j] < min_tau:
+                        min_tau = consistency_matrix[i, j]
+                        lowest_pair = (model_names[i], model_names[j])
+
+            return {
+                'model_names': model_names,
+                'consistency_matrix': consistency_matrix,
+                'low_consistency_pairs': low_consistency_pairs,
+                'n_samples_used': n_samples,
+                'has_divergence': len(low_consistency_pairs) > 0,
+                'avg_consistency': avg_consistency,
+                'lowest_pair': lowest_pair,
+                'lowest_tau': float(min_tau),
+            }
+        except Exception as e:
+            return {'error': str(e)}
 
     def _generate_plotly_figure(self, fig) -> str:
         try:
@@ -764,6 +1212,49 @@ class InterpretabilityReportExporter:
         if 'top_features' in global_shap and global_shap['top_features']:
             pdp_feature = global_shap['top_features'][0]
         pdp_result = self.global_interpreter.compute_pdp(pdp_feature) if pdp_feature else {'error': 'No feature'}
+
+        compare_results = []
+        try:
+            all_consistencies = []
+            for idx in range(min(len(self.X), 20)):
+                shap_res = self.local_interpreter.explain_shap(idx)
+                lime_res = self.local_interpreter.explain_lime(idx)
+                ice_res = self.local_interpreter.explain_ice(idx)
+                if 'error' not in shap_res and 'error' not in lime_res and 'error' not in ice_res:
+                    consistency = self.local_interpreter.compute_consistency_score(shap_res, lime_res, ice_res)
+                    all_consistencies.append((idx, consistency['mean_consistency']))
+
+            if len(all_consistencies) >= 4:
+                all_consistencies.sort(key=lambda x: x[1])
+                low_consistency_idx = all_consistencies[0][0]
+                low_consistency_idx2 = all_consistencies[1][0]
+                high_consistency_idx = all_consistencies[-1][0]
+                high_consistency_idx2 = all_consistencies[-2][0]
+
+                compare_high = self.local_interpreter.explain_compare(high_consistency_idx, high_consistency_idx2)
+                compare_low = self.local_interpreter.explain_compare(low_consistency_idx, low_consistency_idx2)
+
+                if 'error' not in compare_high:
+                    compare_results.append(('高一致性样本对', compare_high))
+                if 'error' not in compare_low:
+                    compare_results.append(('低一致性样本对', compare_low))
+        except Exception:
+            pass
+
+        pdp_multi_result = None
+        try:
+            if len(self.all_models) > 1 and pdp_feature:
+                top_models_for_pdp = [(name, model) for name, model, _ in self.all_models[:3]] if isinstance(self.all_models[0], tuple) and len(self.all_models[0]) == 3 else [(name, model) for name, model in self.all_models[:3]]
+                pdp_multi_result = self.global_interpreter.compute_pdp_multi(pdp_feature, top_models_for_pdp)
+        except Exception:
+            pass
+
+        model_consistency = None
+        try:
+            if len(self.all_models) >= 2:
+                model_consistency = self.compute_model_consistency(n_samples=5)
+        except Exception:
+            pass
 
         html_parts = []
 
@@ -974,7 +1465,27 @@ class InterpretabilityReportExporter:
                     html_parts.append(f"<tr><td>{f['feature']}</td><td>{f['mean_abs_shap']:.4f}</td><td class='unstable-tag'>{f['shap_std']:.4f}</td></tr>")
                 html_parts.append('</table>')
 
-        if 'partial_dependence' in pdp_result:
+        if pdp_multi_result and 'model_results' in pdp_multi_result:
+            pdp_fig = go.Figure()
+            colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
+            for i, model_res in enumerate(pdp_multi_result['model_results']):
+                color = colors[i % len(colors)]
+                pdp_fig.add_trace(go.Scatter(
+                    x=model_res['grid_values'],
+                    y=model_res['partial_dependence'],
+                    mode='lines+markers',
+                    name=model_res['model_name'],
+                    line=dict(color=color, width=3),
+                ))
+            pdp_fig.update_layout(
+                title=f'PDP偏依赖图对比（TOP-{pdp_multi_result["n_models"]}模型）- {pdp_multi_result["feature"]}',
+                xaxis_title=pdp_multi_result['feature'],
+                yaxis_title='预测值（偏依赖）',
+                height=400,
+                legend_title='模型',
+            )
+            html_parts.append(f'<div class="plot-container">{self._generate_plotly_figure(pdp_fig)}</div>')
+        elif 'partial_dependence' in pdp_result:
             pdp_fig = go.Figure()
             pdp_fig.add_trace(go.Scatter(
                 x=pdp_result['grid_values'],
@@ -1066,6 +1577,88 @@ class InterpretabilityReportExporter:
                 )
                 html_parts.append(f'<div class="plot-container">{self._generate_plotly_figure(ice_fig)}</div>')
 
+        if compare_results:
+            html_parts.append('<h2>🔄 样本对比模式</h2>')
+            for compare_label, compare_res in compare_results:
+                s1 = compare_res['sample1']
+                s2 = compare_res['sample2']
+                diff = compare_res['decision_difference']
+
+                html_parts.append(f'<h3>{compare_label}: 样本 #{s1["idx"]} vs 样本 #{s2["idx"]}</h3>')
+
+                html_parts.append(f'''
+<div class="metric-grid">
+    <div class="metric-box">
+        <div class="metric-label">样本 #{s1["idx"]} 预测值</div>
+        <div class="metric-value">{diff["prediction_sample1"]:.4f}</div>
+    </div>
+    <div class="metric-box">
+        <div class="metric-label">样本 #{s2["idx"]} 预测值</div>
+        <div class="metric-value">{diff["prediction_sample2"]:.4f}</div>
+    </div>
+    <div class="metric-box">
+        <div class="metric-label">预测值差异</div>
+        <div class="metric-value">{diff["prediction_diff"]:.4f}</div>
+    </div>
+    <div class="metric-box">
+        <div class="metric-label">贡献方向相反特征数</div>
+        <div class="metric-value">{diff["n_opposite_features"]}</div>
+    </div>
+</div>
+''')
+
+                html_parts.append('<h4>📊 SHAP瀑布图对比</h4>')
+                for sample_key, sample_data in [('s1', s1), ('s2', s2)]:
+                    shap_res = sample_data['shap']
+                    if 'feature_contributions' in shap_res:
+                        contribs = shap_res['feature_contributions'][:10]
+                        shap_waterfall = go.Figure()
+                        cum_val = shap_res.get('base_value', 0)
+                        shap_waterfall.add_trace(go.Waterfall(
+                            orientation='v',
+                            measure=['absolute'] + ['relative'] * len(contribs) + ['total'],
+                            x=['E[f(x)]'] + [f"{c['feature']}={c['value']:.2f}" for c in contribs] + ['f(x)'],
+                            y=[cum_val] + [c['shap_value'] for c in contribs] + [sum([cum_val] + [c['shap_value'] for c in contribs])],
+                            connector={'line': {'color': 'rgb(100,100,100)'}},
+                        ))
+                        shap_waterfall.update_layout(
+                            title=f'样本 #{sample_data["idx"]} SHAP瀑布图',
+                            height=400,
+                        )
+                        html_parts.append(f'<div class="plot-container" style="display: inline-block; width: 48%; margin: 1%;">{self._generate_plotly_figure(shap_waterfall)}</div>')
+
+                html_parts.append('<h4>📊 LIME特征权重对比</h4>')
+                for sample_key, sample_data in [('s1', s1), ('s2', s2)]:
+                    lime_res = sample_data['lime']
+                    if 'feature_weights' in lime_res:
+                        weights = lime_res['feature_weights'][:10]
+                        lime_fig = go.Figure()
+                        lime_fig.add_trace(go.Bar(
+                            x=[w['weight'] for w in reversed(weights)],
+                            y=[w['feature'] for w in reversed(weights)],
+                            orientation='h',
+                            marker_color=['#e74c3c' if w['weight'] < 0 else '#27ae60' for w in reversed(weights)],
+                        ))
+                        lime_fig.update_layout(
+                            title=f'样本 #{sample_data["idx"]} LIME特征权重',
+                            xaxis_title='特征权重',
+                            height=400,
+                        )
+                        html_parts.append(f'<div class="plot-container" style="display: inline-block; width: 48%; margin: 1%;">{self._generate_plotly_figure(lime_fig)}</div>')
+
+                if diff.get('opposite_features'):
+                    html_parts.append('<h4>⚡ 决策差异分析 - 贡献方向相反的特征</h4>')
+                    html_parts.append('<table><tr><th>特征</th><th>样本1 SHAP</th><th>样本2 SHAP</th><th>差异绝对值</th><th>方向变化</th></tr>')
+                    for feat in diff['opposite_features'][:10]:
+                        html_parts.append(
+                            f"<tr><td>{feat['feature']}</td>"
+                            f"<td style='color: {'#27ae60' if feat['sample1_shap'] > 0 else '#e74c3c'};'>{feat['sample1_shap']:.4f}</td>"
+                            f"<td style='color: {'#27ae60' if feat['sample2_shap'] > 0 else '#e74c3c'};'>{feat['sample2_shap']:.4f}</td>"
+                            f"<td><strong>{feat['diff_abs']:.4f}</strong></td>"
+                            f"<td>{feat['direction']}</td></tr>"
+                        )
+                    html_parts.append('</table>')
+
         html_parts.append('<h2>🛡️ 对抗性解释检测</h2>')
         adv = adversarial_result
         html_parts.append(f'''
@@ -1086,18 +1679,78 @@ class InterpretabilityReportExporter:
 ''')
 
         if adv.get('sample_results'):
-            html_parts.append('<h3>详细检测结果</h3><table><tr><th>样本</th><th>状态</th><th>Mean τ</th><th>SHAP τ</th><th>LIME τ</th><th>ICE τ</th><th>预测变化</th></tr>')
+            html_parts.append('<h3>详细检测结果</h3><table><tr><th>样本</th><th>状态</th><th>Mean τ</th><th>SHAP τ</th><th>LIME τ</th><th>ICE τ</th><th>预测变化</th><th>触发特征</th></tr>')
             for r in adv['sample_results']:
                 badge = '<span class="badge-sensitive">敏感</span>' if r['is_sensitive'] else '<span class="badge-ok">稳定</span>'
+                trigger_feat = r.get('trigger_feature', '-')
+                if trigger_feat is None:
+                    trigger_feat = '-'
                 html_parts.append(
                     f"<tr><td>#{r['sample_idx']}</td><td>{badge}</td>"
                     f"<td>{r['mean_kendall_tau']:.3f}</td>"
                     f"<td>{r['shap_tau']:.3f}</td>"
                     f"<td>{r['lime_tau']:.3f}</td>"
                     f"<td>{r['ice_tau']:.3f}</td>"
-                    f"<td>{r['prediction_change']:.4f}</td></tr>"
+                    f"<td>{r['prediction_change']:.4f}</td>"
+                    f"<td><strong>{trigger_feat}</strong></td></tr>"
                 )
             html_parts.append('</table>')
+
+        if model_consistency and 'model_names' in model_consistency:
+            html_parts.append('<h2>🔗 模型间解释一致性对比</h2>')
+
+            mc = model_consistency
+            html_parts.append(f'''
+<div class="metric-grid">
+    <div class="metric-box">
+        <div class="metric-label">参与对比模型数</div>
+        <div class="metric-value">{len(mc["model_names"])}</div>
+    </div>
+    <div class="metric-box">
+        <div class="metric-label">用于计算的样本数</div>
+        <div class="metric-value">{mc["n_samples_used"]}</div>
+    </div>
+    <div class="metric-box">
+        <div class="metric-label">是否存在解释分歧</div>
+        <div class="metric-value">{'是' if mc["has_divergence"] else '否'}</div>
+    </div>
+</div>
+''')
+
+            heatmap_fig = go.Figure(data=go.Heatmap(
+                z=mc['consistency_matrix'],
+                x=mc['model_names'],
+                y=mc['model_names'],
+                text=[[f'{val:.3f}' for val in row] for row in mc['consistency_matrix']],
+                texttemplate='%{text}',
+                textfont={"size": 12},
+                colorscale='RdBu_r',
+                zmin=-1,
+                zmax=1,
+                hoverongaps=False,
+            ))
+            heatmap_fig.update_layout(
+                title='模型间特征重要性排序一致性（Kendall τ）',
+                xaxis_title='模型',
+                yaxis_title='模型',
+                height=500,
+            )
+            html_parts.append(f'<div class="plot-container">{self._generate_plotly_figure(heatmap_fig)}</div>')
+
+            if mc.get('low_consistency_pairs'):
+                html_parts.append('<h4>⚠️ 解释分歧模型对（τ < 0.4）</h4>')
+                html_parts.append('<div class="suggestion-box">')
+                html_parts.append('<strong>💡 提示：</strong>以下模型虽然性能接近，但决策逻辑可能有本质区别，建议谨慎选择。')
+                html_parts.append('</div>')
+                html_parts.append('<table><tr><th>模型1</th><th>模型2</th><th>Kendall τ</th><th>状态</th></tr>')
+                for pair in mc['low_consistency_pairs']:
+                    html_parts.append(
+                        f"<tr><td>{pair['model1']}</td>"
+                        f"<td>{pair['model2']}</td>"
+                        f"<td style='color: #e74c3c;'><strong>{pair['kendall_tau']:.3f}</strong></td>"
+                        f"<td><span class='badge-conflict'>解释分歧</span></td></tr>"
+                    )
+                html_parts.append('</table>')
 
         html_parts.append(f'''
 <h2>🏁 结论</h2>
@@ -1133,7 +1786,8 @@ class ModelInterpretabilityAnalyzer:
     def __init__(self, model, X: pd.DataFrame, y: pd.Series,
                  task_type: str = 'binary', model_name: str = 'Unknown',
                  feature_names: Optional[List[str]] = None,
-                 column_types: Optional[Dict] = None, random_state: int = 42):
+                 column_types: Optional[Dict] = None, random_state: int = 42,
+                 all_models: Optional[List[Tuple[str, Any]]] = None):
         self.model = model
         self.X = X
         self.y = y
@@ -1142,6 +1796,7 @@ class ModelInterpretabilityAnalyzer:
         self.feature_names = feature_names if feature_names else list(X.columns)
         self.column_types = column_types or {}
         self.random_state = random_state
+        self.all_models = all_models
 
         self.local = LocalInterpreter(model, X, task_type, self.feature_names, random_state)
         self.global_ = GlobalInterpreter(model, X, y, task_type, self.feature_names, random_state)
@@ -1149,7 +1804,8 @@ class ModelInterpretabilityAnalyzer:
             model, X, task_type, self.feature_names, self.column_types, random_state
         )
         self.reporter = InterpretabilityReportExporter(
-            model, X, y, task_type, model_name, self.feature_names, self.column_types, random_state
+            model, X, y, task_type, model_name, self.feature_names,
+            self.column_types, random_state, all_models=all_models
         )
 
     def run_full_analysis(self, output_dir: str = './output') -> Dict:

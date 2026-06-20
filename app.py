@@ -1012,104 +1012,107 @@ def step_interpretability():
 
     with tab1:
         st.header("🔍 局部解释面板")
-        st.caption("选择一条样本，同时展示三种局部解释结果对比")
+        local_subtab1, local_subtab2 = st.tabs(["📊 单样本解释", "🔄 样本对比模式"])
 
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            sample_idx = st.number_input(
-                "选择样本索引",
-                min_value=0,
-                max_value=max(0, len(X) - 1),
-                value=0,
-                step=1,
-                key="local_sample_idx",
-            )
+        with local_subtab1:
+            st.caption("选择一条样本，同时展示三种局部解释结果对比")
 
-        with col2:
-            st.markdown("**样本特征值预览:**")
-            sample_row = X.iloc[[sample_idx]]
-            st.dataframe(sample_row.T, use_container_width=True)
-
-        if st.button("🔬 分析该样本", key="run_local"):
-            with st.spinner("正在计算局部解释..."):
-                local = LocalInterpreter(
-                    best_model, X, pipeline.task_type, feature_names, pipeline.random_state
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                sample_idx = st.number_input(
+                    "选择样本索引",
+                    min_value=0,
+                    max_value=max(0, len(X) - 1),
+                    value=0,
+                    step=1,
+                    key="local_sample_idx",
                 )
-                shap_res = local.explain_shap(sample_idx)
-                lime_res = local.explain_lime(sample_idx)
-                ice_res = local.explain_ice(sample_idx)
 
-                if 'error' in shap_res:
-                    st.error(f"SHAP解释出错: {shap_res['error']}")
-                if 'error' in lime_res:
-                    st.error(f"LIME解释出错: {lime_res['error']}")
-                if 'error' in ice_res:
-                    st.error(f"ICE解释出错: {ice_res['error']}")
+            with col2:
+                st.markdown("**样本特征值预览:**")
+                sample_row = X.iloc[[sample_idx]]
+                st.dataframe(sample_row.T, use_container_width=True)
 
-                if 'error' not in shap_res and 'error' not in lime_res and 'error' not in ice_res:
-                    consistency = local.compute_consistency_score(shap_res, lime_res, ice_res)
-
-                    st.markdown("---")
-                    col_c1, col_c2, col_c3, col_c4 = st.columns(4)
-                    col_c1.metric("SHAP vs LIME (τ)", f"{consistency['kendall_shap_lime']:.3f}")
-                    col_c2.metric("SHAP vs ICE (τ)", f"{consistency['kendall_shap_ice']:.3f}")
-                    col_c3.metric("LIME vs ICE (τ)", f"{consistency['kendall_lime_ice']:.3f}")
-                    col_c4.metric(
-                        "一致性评分",
-                        f"{consistency['mean_consistency']:.3f}",
-                        delta=consistency['label'],
-                        delta_color='inverse' if consistency['is_conflict'] else 'normal',
+            if st.button("🔬 分析该样本", key="run_local"):
+                with st.spinner("正在计算局部解释..."):
+                    local = LocalInterpreter(
+                        best_model, X, pipeline.task_type, feature_names, pipeline.random_state
                     )
-                    if consistency['is_conflict']:
-                        st.warning("⚠️ **解释冲突**：三种方法的特征重要性排序一致性低于0.6，建议谨慎分析该样本的模型决策。")
+                    shap_res = local.explain_shap(sample_idx)
+                    lime_res = local.explain_lime(sample_idx)
+                    ice_res = local.explain_ice(sample_idx)
 
-                    st.markdown("---")
-                    col_s1, col_s2, col_s3 = st.columns(3)
+                    if 'error' in shap_res:
+                        st.error(f"SHAP解释出错: {shap_res['error']}")
+                    if 'error' in lime_res:
+                        st.error(f"LIME解释出错: {lime_res['error']}")
+                    if 'error' in ice_res:
+                        st.error(f"ICE解释出错: {ice_res['error']}")
 
-                    with col_s1:
-                        st.subheader("SHAP瀑布图")
-                        if 'feature_contributions' in shap_res:
-                            fig, ax = plt.subplots(figsize=(8, 8))
-                            contribs = shap_res['feature_contributions'][:10]
-                            feats = [f"{c['feature']}={c['value']:.2f}" for c in contribs]
-                            vals = [c['shap_value'] for c in contribs]
-                            base_val = shap_res.get('base_value', 0)
+                    if 'error' not in shap_res and 'error' not in lime_res and 'error' not in ice_res:
+                        consistency = local.compute_consistency_score(shap_res, lime_res, ice_res)
 
-                            cum_vals = [base_val]
-                            for v in vals:
-                                cum_vals.append(cum_vals[-1] + v)
+                        st.markdown("---")
+                        col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+                        col_c1.metric("SHAP vs LIME (τ)", f"{consistency['kendall_shap_lime']:.3f}")
+                        col_c2.metric("SHAP vs ICE (τ)", f"{consistency['kendall_shap_ice']:.3f}")
+                        col_c3.metric("LIME vs ICE (τ)", f"{consistency['kendall_lime_ice']:.3f}")
+                        col_c4.metric(
+                            "一致性评分",
+                            f"{consistency['mean_consistency']:.3f}",
+                            delta=consistency['label'],
+                            delta_color='inverse' if consistency['is_conflict'] else 'normal',
+                        )
+                        if consistency['is_conflict']:
+                            st.warning("⚠️ **解释冲突**：三种方法的特征重要性排序一致性低于0.6，建议谨慎分析该样本的模型决策。")
 
-                            colors = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals]
-                            y_pos = np.arange(len(contribs))
+                        st.markdown("---")
+                        col_s1, col_s2, col_s3 = st.columns(3)
 
-                            for i, (feat, val, cum, color) in enumerate(zip(feats, vals, cum_vals[:-1], colors)):
-                                ax.barh(i, val, left=cum, color=color, alpha=0.8, height=0.6)
+                        with col_s1:
+                            st.subheader("SHAP瀑布图")
+                            if 'feature_contributions' in shap_res:
+                                fig, ax = plt.subplots(figsize=(8, 8))
+                                contribs = shap_res['feature_contributions'][:10]
+                                feats = [f"{c['feature']}={c['value']:.2f}" for c in contribs]
+                                vals = [c['shap_value'] for c in contribs]
+                                base_val = shap_res.get('base_value', 0)
 
-                            ax.set_yticks(y_pos)
-                            ax.set_yticklabels(feats)
-                            ax.axvline(x=base_val, color='gray', linestyle='--', alpha=0.5, label=f'Base: {base_val:.3f}')
-                            ax.axvline(x=cum_vals[-1], color='blue', linestyle='-', alpha=0.7, label=f'Pred: {cum_vals[-1]:.3f}')
-                            ax.set_xlabel('SHAP值')
-                            ax.set_title(f'SHAP瀑布图 - 样本 #{sample_idx}')
-                            ax.legend()
-                            ax.invert_yaxis()
-                            plt.tight_layout()
-                            st.pyplot(fig)
-                            plt.close(fig)
+                                cum_vals = [base_val]
+                                for v in vals:
+                                    cum_vals.append(cum_vals[-1] + v)
 
-                    with col_s2:
-                        st.subheader("LIME特征权重")
-                        if 'feature_weights' in lime_res:
-                            fig, ax = plt.subplots(figsize=(8, 8))
-                            weights = lime_res['feature_weights'][:10]
-                            feats = [w['feature'] for w in weights]
-                            vals = [w['weight'] for w in weights]
-                            colors = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals]
+                                colors = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals]
+                                y_pos = np.arange(len(contribs))
 
-                            y_pos = np.arange(len(feats))
-                            ax.barh(y_pos, vals, color=colors, alpha=0.8, height=0.6)
-                            ax.set_yticks(y_pos)
-                            ax.set_yticklabels(feats)
+                                for i, (feat, val, cum, color) in enumerate(zip(feats, vals, cum_vals[:-1], colors)):
+                                    ax.barh(i, val, left=cum, color=color, alpha=0.8, height=0.6)
+
+                                ax.set_yticks(y_pos)
+                                ax.set_yticklabels(feats)
+                                ax.axvline(x=base_val, color='gray', linestyle='--', alpha=0.5, label=f'Base: {base_val:.3f}')
+                                ax.axvline(x=cum_vals[-1], color='blue', linestyle='-', alpha=0.7, label=f'Pred: {cum_vals[-1]:.3f}')
+                                ax.set_xlabel('SHAP值')
+                                ax.set_title(f'SHAP瀑布图 - 样本 #{sample_idx}')
+                                ax.legend()
+                                ax.invert_yaxis()
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+
+                        with col_s2:
+                            st.subheader("LIME特征权重")
+                            if 'feature_weights' in lime_res:
+                                fig, ax = plt.subplots(figsize=(8, 8))
+                                weights = lime_res['feature_weights'][:10]
+                                feats = [w['feature'] for w in weights]
+                                vals = [w['weight'] for w in weights]
+                                colors = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals]
+
+                                y_pos = np.arange(len(feats))
+                                ax.barh(y_pos, vals, color=colors, alpha=0.8, height=0.6)
+                                ax.set_yticks(y_pos)
+                                ax.set_yticklabels(feats)
                             ax.axvline(x=0, color='gray', linestyle='-', alpha=0.5)
                             ax.set_xlabel('特征权重')
                             ax.set_title(f'LIME特征权重 - 样本 #{sample_idx}')
@@ -1152,6 +1155,185 @@ def step_interpretability():
                         'ICE': ice_res.get('top_features', []),
                     }, index=[f'Rank {i+1}' for i in range(5)])
                     st.dataframe(compare_df, use_container_width=True)
+
+        with local_subtab2:
+            st.caption("选择两条样本（建议一条正例一条反例），并排展示解释结果并分析决策差异")
+
+            col_comp1, col_comp2 = st.columns(2)
+            with col_comp1:
+                sample_idx1 = st.number_input(
+                    "样本1索引（建议正例）",
+                    min_value=0,
+                    max_value=max(0, len(X) - 1),
+                    value=0,
+                    step=1,
+                    key="compare_sample1",
+                )
+                st.markdown("**样本1特征值预览:**")
+                sample_row1 = X.iloc[[sample_idx1]]
+                st.dataframe(sample_row1.T, use_container_width=True)
+
+            with col_comp2:
+                sample_idx2 = st.number_input(
+                    "样本2索引（建议反例）",
+                    min_value=0,
+                    max_value=max(0, len(X) - 1),
+                    value=min(1, len(X) - 1),
+                    step=1,
+                    key="compare_sample2",
+                )
+                st.markdown("**样本2特征值预览:**")
+                sample_row2 = X.iloc[[sample_idx2]]
+                st.dataframe(sample_row2.T, use_container_width=True)
+
+            if st.button("🔬 对比分析两个样本", key="run_compare"):
+                with st.spinner("正在计算样本对比解释..."):
+                    local = LocalInterpreter(
+                        best_model, X, pipeline.task_type, feature_names, pipeline.random_state
+                    )
+                    compare_res = local.explain_compare(sample_idx1, sample_idx2)
+
+                    if 'error' in compare_res:
+                        st.error(f"对比分析出错: {compare_res['error']}")
+                    else:
+                        s1 = compare_res['sample1']
+                        s2 = compare_res['sample2']
+                        diff = compare_res['decision_difference']
+
+                        st.markdown("---")
+                        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                        col_m1.metric(f"样本 #{s1['idx']} 预测值", f"{diff['prediction_sample1']:.4f}")
+                        col_m2.metric(f"样本 #{s2['idx']} 预测值", f"{diff['prediction_sample2']:.4f}")
+                        col_m3.metric("预测值差异", f"{diff['prediction_diff']:.4f}")
+                        col_m4.metric("贡献方向相反特征数", diff['n_opposite_features'])
+
+                        st.info(diff['summary'])
+
+                        st.markdown("---")
+                        st.subheader("📊 SHAP瀑布图对比")
+                        col_w1, col_w2 = st.columns(2)
+
+                        with col_w1:
+                            shap1 = s1['shap']
+                            if 'feature_contributions' in shap1:
+                                fig, ax = plt.subplots(figsize=(8, 8))
+                                contribs1 = shap1['feature_contributions'][:10]
+                                feats1 = [f"{c['feature']}={c['value']:.2f}" for c in contribs1]
+                                vals1 = [c['shap_value'] for c in contribs1]
+                                base_val1 = shap1.get('base_value', 0)
+
+                                cum_vals1 = [base_val1]
+                                for v in vals1:
+                                    cum_vals1.append(cum_vals1[-1] + v)
+
+                                colors1 = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals1]
+                                y_pos1 = np.arange(len(contribs1))
+
+                                for i, (feat, val, cum, color) in enumerate(zip(feats1, vals1, cum_vals1[:-1], colors1)):
+                                    ax.barh(i, val, left=cum, color=color, alpha=0.8, height=0.6)
+
+                                ax.set_yticks(y_pos1)
+                                ax.set_yticklabels(feats1)
+                                ax.axvline(x=base_val1, color='gray', linestyle='--', alpha=0.5, label=f'Base: {base_val1:.3f}')
+                                ax.axvline(x=cum_vals1[-1], color='blue', linestyle='-', alpha=0.7, label=f'Pred: {cum_vals1[-1]:.3f}')
+                                ax.set_xlabel('SHAP值')
+                                ax.set_title(f'样本 #{s1["idx"]} SHAP瀑布图')
+                                ax.legend()
+                                ax.invert_yaxis()
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+
+                        with col_w2:
+                            shap2 = s2['shap']
+                            if 'feature_contributions' in shap2:
+                                fig, ax = plt.subplots(figsize=(8, 8))
+                                contribs2 = shap2['feature_contributions'][:10]
+                                feats2 = [f"{c['feature']}={c['value']:.2f}" for c in contribs2]
+                                vals2 = [c['shap_value'] for c in contribs2]
+                                base_val2 = shap2.get('base_value', 0)
+
+                                cum_vals2 = [base_val2]
+                                for v in vals2:
+                                    cum_vals2.append(cum_vals2[-1] + v)
+
+                                colors2 = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals2]
+                                y_pos2 = np.arange(len(contribs2))
+
+                                for i, (feat, val, cum, color) in enumerate(zip(feats2, vals2, cum_vals2[:-1], colors2)):
+                                    ax.barh(i, val, left=cum, color=color, alpha=0.8, height=0.6)
+
+                                ax.set_yticks(y_pos2)
+                                ax.set_yticklabels(feats2)
+                                ax.axvline(x=base_val2, color='gray', linestyle='--', alpha=0.5, label=f'Base: {base_val2:.3f}')
+                                ax.axvline(x=cum_vals2[-1], color='blue', linestyle='-', alpha=0.7, label=f'Pred: {cum_vals2[-1]:.3f}')
+                                ax.set_xlabel('SHAP值')
+                                ax.set_title(f'样本 #{s2["idx"]} SHAP瀑布图')
+                                ax.legend()
+                                ax.invert_yaxis()
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+
+                        st.markdown("---")
+                        st.subheader("📊 LIME特征权重对比")
+                        col_l1, col_l2 = st.columns(2)
+
+                        with col_l1:
+                            lime1 = s1['lime']
+                            if 'feature_weights' in lime1:
+                                fig, ax = plt.subplots(figsize=(8, 8))
+                                weights1 = lime1['feature_weights'][:10]
+                                feats1 = [w['feature'] for w in weights1]
+                                vals1 = [w['weight'] for w in weights1]
+                                colors1 = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals1]
+
+                                y_pos1 = np.arange(len(feats1))
+                                ax.barh(y_pos1, vals1, color=colors1, alpha=0.8, height=0.6)
+                                ax.set_yticks(y_pos1)
+                                ax.set_yticklabels(feats1)
+                                ax.axvline(x=0, color='gray', linestyle='-', alpha=0.5)
+                                ax.set_xlabel('特征权重')
+                                ax.set_title(f'样本 #{s1["idx"]} LIME特征权重')
+                                ax.invert_yaxis()
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+
+                        with col_l2:
+                            lime2 = s2['lime']
+                            if 'feature_weights' in lime2:
+                                fig, ax = plt.subplots(figsize=(8, 8))
+                                weights2 = lime2['feature_weights'][:10]
+                                feats2 = [w['feature'] for w in weights2]
+                                vals2 = [w['weight'] for w in weights2]
+                                colors2 = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals2]
+
+                                y_pos2 = np.arange(len(feats2))
+                                ax.barh(y_pos2, vals2, color=colors2, alpha=0.8, height=0.6)
+                                ax.set_yticks(y_pos2)
+                                ax.set_yticklabels(feats2)
+                                ax.axvline(x=0, color='gray', linestyle='-', alpha=0.5)
+                                ax.set_xlabel('特征权重')
+                                ax.set_title(f'样本 #{s2["idx"]} LIME特征权重')
+                                ax.invert_yaxis()
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+
+                        if diff.get('opposite_features'):
+                            st.markdown("---")
+                            st.subheader("⚡ 决策差异分析")
+                            st.caption("以下特征在两个样本间的SHAP贡献方向相反（一个正贡献一个负贡献），按差异绝对值从大到小排序：")
+
+                            diff_df = pd.DataFrame(diff['opposite_features'])[
+                                ['feature', 'sample1_shap', 'sample2_shap', 'diff_abs', 'direction']
+                            ]
+                            diff_df.columns = ['特征', '样本1 SHAP值', '样本2 SHAP值', '差异绝对值', '方向变化']
+                            st.dataframe(diff_df, use_container_width=True)
+
+                            st.info(f"💡 **分析提示**: 这 {diff['n_opposite_features']} 个特征是导致两个样本预测结果差异的关键因素。"
+                                    f" 它们在样本1和样本2中起到了相反的推动作用。")
 
     with tab2:
         st.header("🌐 全局解释面板")
@@ -1263,20 +1445,59 @@ def step_interpretability():
         if st.button("📈 绘制PDP", key="run_pdp"):
             with st.spinner("正在计算偏依赖图..."):
                 if pdp_mode == "一维PDP":
-                    pdp_res = global_interp.compute_pdp(pdp_feat1)
-                    if 'error' not in pdp_res:
-                        fig, ax = plt.subplots(figsize=(10, 6))
-                        ax.plot(pdp_res['grid_values'], pdp_res['partial_dependence'], 'r-', linewidth=2.5, marker='o')
-                        ax.fill_between(pdp_res['grid_values'], pdp_res['partial_dependence'], alpha=0.15, color='red')
-                        ax.set_xlabel(pdp_feat1)
-                        ax.set_ylabel('预测值（偏依赖）')
-                        ax.set_title(f'一维偏依赖图 - {pdp_feat1}')
-                        ax.grid(True, alpha=0.3)
-                        plt.tight_layout()
-                        st.pyplot(fig)
-                        plt.close(fig)
+                    top_models = []
+                    if pipeline.model_selector:
+                        top_models_raw = pipeline.model_selector.get_top_models(n=3)
+                        top_models = [(name, model) for name, model, _ in top_models_raw]
+
+                    if len(top_models) > 1:
+                        pdp_res = global_interp.compute_pdp_multi(pdp_feat1, top_models)
+                        if 'error' not in pdp_res and 'model_results' in pdp_res:
+                            fig, ax = plt.subplots(figsize=(10, 6))
+                            colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
+                            markers = ['o', 's', '^', 'D', 'v']
+
+                            for i, model_res in enumerate(pdp_res['model_results']):
+                                color = colors[i % len(colors)]
+                                marker = markers[i % len(markers)]
+                                ax.plot(
+                                    model_res['grid_values'],
+                                    model_res['partial_dependence'],
+                                    color=color,
+                                    linewidth=2.5,
+                                    marker=marker,
+                                    label=model_res['model_name'],
+                                    alpha=0.8
+                                )
+
+                            ax.set_xlabel(pdp_feat1)
+                            ax.set_ylabel('预测值（偏依赖）')
+                            ax.set_title(f'一维偏依赖图对比（TOP-{pdp_res["n_models"]}模型）- {pdp_feat1}')
+                            ax.grid(True, alpha=0.3)
+                            ax.legend(title='模型')
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close(fig)
+
+                            st.info(f"💡 图中展示了{pdp_res['n_models']}个模型对同一特征的偏依赖模式。"
+                                    f" 不同颜色的曲线代表不同模型，可以直观对比它们的决策逻辑差异。")
+                        else:
+                            st.error(f"多模型PDP计算失败: {pdp_res.get('error', '未知错误')}")
                     else:
-                        st.error(f"PDP计算失败: {pdp_res.get('error', '未知错误')}")
+                        pdp_res = global_interp.compute_pdp(pdp_feat1)
+                        if 'error' not in pdp_res:
+                            fig, ax = plt.subplots(figsize=(10, 6))
+                            ax.plot(pdp_res['grid_values'], pdp_res['partial_dependence'], 'r-', linewidth=2.5, marker='o')
+                            ax.fill_between(pdp_res['grid_values'], pdp_res['partial_dependence'], alpha=0.15, color='red')
+                            ax.set_xlabel(pdp_feat1)
+                            ax.set_ylabel('预测值（偏依赖）')
+                            ax.set_title(f'一维偏依赖图 - {pdp_feat1}')
+                            ax.grid(True, alpha=0.3)
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close(fig)
+                        else:
+                            st.error(f"PDP计算失败: {pdp_res.get('error', '未知错误')}")
                 else:
                     pdp_res = global_interp.compute_pdp_2d(pdp_feat1, pdp_feat2)
                     if 'error' not in pdp_res:
@@ -1289,7 +1510,7 @@ def step_interpretability():
                         ax.clabel(cs2, inline=True, fontsize=8)
                         ax.set_xlabel(pdp_feat1)
                         ax.set_ylabel(pdp_feat2)
-                        ax.set_title(f'二维偏依赖等高线图 - {pdp_feat1} vs {pdp_feat2}')
+                        ax.set_title(f'二维偏依赖等高线图（最优模型）- {pdp_feat1} vs {pdp_feat2}')
                         plt.tight_layout()
                         st.pyplot(fig)
                         plt.close(fig)
@@ -1358,6 +1579,12 @@ def step_interpretability():
             col_a_p2.metric("扰动后预测", f"{adv_single['perturbed_prediction']:.4f}")
             col_a_p3.metric("预测变化量", f"{adv_single['prediction_change']:.4f}")
 
+            trigger_feat = adv_single.get('trigger_feature')
+            if trigger_feat:
+                st.markdown(f"#### 🎯 归因不稳定特征: **{trigger_feat}**")
+                st.info(f"💡 特征 **{trigger_feat}** 的扰动导致了解释排序变化最大（Kendall τ 下降 {adv_single.get('max_tau_drop', 0):.3f}），"
+                        f"是导致该样本解释敏感的主要原因。")
+
             if adv_single['is_sensitive']:
                 st.warning("⚠️ **解释敏感样本**：微小扰动导致解释大幅变动，该样本的模型预测可能不可靠。")
 
@@ -1391,9 +1618,13 @@ def step_interpretability():
                 with st.expander("📋 查看详细检测结果"):
                     detail_rows = []
                     for r in adv_batch['sample_results']:
+                        trigger_feat = r.get('trigger_feature', '-')
+                        if trigger_feat is None:
+                            trigger_feat = '-'
                         detail_rows.append({
                             '样本索引': f"#{r['sample_idx']}",
                             '状态': r['label'],
+                            '触发特征': trigger_feat,
                             'Mean τ': f"{r['mean_kendall_tau']:.3f}",
                             'SHAP τ': f"{r['shap_tau']:.3f}",
                             'LIME τ': f"{r['lime_tau']:.3f}",
@@ -1402,6 +1633,23 @@ def step_interpretability():
                         })
                     detail_df = pd.DataFrame(detail_rows)
                     st.dataframe(detail_df, use_container_width=True)
+
+                    if any(r.get('trigger_feature') for r in adv_batch['sample_results'] if r.get('is_sensitive')):
+                        st.markdown("#### 🎯 敏感样本归因不稳定特征汇总")
+                        trigger_feats = {}
+                        for r in adv_batch['sensitive_samples']:
+                            feat = r.get('trigger_feature')
+                            if feat:
+                                trigger_feats[feat] = trigger_feats.get(feat, 0) + 1
+
+                        if trigger_feats:
+                            trigger_df = pd.DataFrame([
+                                {'特征': feat, '触发次数': count}
+                                for feat, count in sorted(trigger_feats.items(), key=lambda x: x[1], reverse=True)
+                            ])
+                            st.dataframe(trigger_df, use_container_width=True)
+                            st.info(f"💡 **分析提示**: 上述特征是最常导致解释敏感的不稳定特征。"
+                                    f" 建议重点关注这些特征的数据质量和分布，考虑对其进行特征变换或正则化处理。")
 
             if adv_batch.get('sensitive_samples'):
                 st.markdown("#### ⚠️ 敏感样本列表")
@@ -1417,9 +1665,15 @@ def step_interpretability():
         if st.button("📤 生成并导出HTML报告", type="primary", key="gen_report"):
             with st.spinner("正在生成HTML报告（可能需要几分钟）..."):
                 try:
+                    all_models = None
+                    if pipeline.model_selector:
+                        top_models_raw = pipeline.model_selector.get_top_models(n=3)
+                        all_models = [(name, model) for name, model, _ in top_models_raw]
+
                     reporter = InterpretabilityReportExporter(
                         best_model, X, y, pipeline.task_type, best_model_name,
                         feature_names, pipeline.column_types, pipeline.random_state,
+                        all_models=all_models,
                     )
                     import os
                     os.makedirs(report_dir, exist_ok=True)
