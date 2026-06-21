@@ -23,6 +23,9 @@ from src.interpretability import (
     AdversarialExplainer, InterpretabilityReportExporter,
     ModelInterpretabilityAnalyzer,
 )
+from src.drift_detection import (
+    DriftDetector, AlertStorage, DriftReportExporter,
+)
 
 st.set_page_config(
     page_title="AutoML Pipeline - 自动特征工程与模型选择",
@@ -60,6 +63,12 @@ def init_session_state():
         st.session_state.diagnosis_result = None
     if 'interpretability_result' not in st.session_state:
         st.session_state.interpretability_result = None
+    if 'drift_detection_result' not in st.session_state:
+        st.session_state.drift_detection_result = None
+    if 'drift_reference_df' not in st.session_state:
+        st.session_state.drift_reference_df = None
+    if 'drift_new_df' not in st.session_state:
+        st.session_state.drift_new_df = None
     if 'is_running' not in st.session_state:
         st.session_state.is_running = False
 
@@ -76,7 +85,8 @@ def step_navigation():
         "[4] 自动模型选择",
         "[5] 模型对比与诊断",
         "[6] 模型可解释性分析",
-        "[7] Pipeline导出",
+        "[7] 数据漂移检测",
+        "[8] Pipeline导出",
     ]
 
     for i, step in enumerate(steps):
@@ -95,8 +105,8 @@ def step_navigation():
             st.session_state.current_step = max(0, st.session_state.current_step - 1)
             st.rerun()
     with col2:
-        if st.button("下一步 ->", disabled=st.session_state.current_step >= 6):
-            st.session_state.current_step = min(6, st.session_state.current_step + 1)
+        if st.button("下一步 ->", disabled=st.session_state.current_step >= 7):
+            st.session_state.current_step = min(7, st.session_state.current_step + 1)
             st.rerun()
 
 
@@ -1742,13 +1752,636 @@ def step_interpretability():
             st.markdown("---")
             st.info("💡 已完成完整分析，可直接使用上方按钮导出报告")
 
-    if st.button("➡️ 下一步：导出Pipeline", type="primary"):
+    if st.button("➡️ 下一步：数据漂移检测", type="primary"):
         st.session_state.current_step = 6
         st.rerun()
 
 
+def step_drift_detection():
+    """步骤7: 数据漂移检测面板"""
+    st.title("📊 数据漂移检测与告警")
+
+    pipeline = st.session_state.pipeline
+
+    left_col, right_col = st.columns([1, 3])
+
+    with left_col:
+        st.subheader("🗂️ 数据集选择")
+
+        st.markdown("**参考数据集 (Reference)")
+        st.caption("用于对比的基准数据集，默认使用训练时的验证集")
+        ref_option = st.radio(
+            "选择参考数据来源",
+            options=["使用Pipeline内部验证集", "上传CSV文件"],
+            index=0,
+            key="ref_data_source",
+        )
+
+        ref_df = None
+        ref_name = ""
+
+        if ref_option == "使用Pipeline内部验证集":
+            if pipeline.diagnostician and hasattr(pipeline.diagnostician, "X_train") and pipeline.diagnostician.X_train is not None:
+                ref_df = pipeline.diagnostician.X_train.copy()
+                ref_name = "训练集(诊断划分)"
+                st.success(f"✅ 已加载内部参考数据集，共 {len(ref_df)} 行 {len(ref_df.columns)} 列")
+            elif pipeline.X_full is not None:
+                ref_df = pipeline.X_full.copy()
+                ref_name = "完整特征矩阵"
+                st.success(f"✅ 已加载Pipeline特征矩阵，共 {len(ref_df)} 行 {len(ref_df.columns)} 列")
+            else:
+                st.warning("⚠️ Pipeline内部暂无数据，请先完成模型训练或上传CSV参考数据")
+        else:
+            ref_file = st.file_uploader(
+                "上传参考数据集CSV",
+                type=["csv"],
+                key="ref_file_upload",
+            )
+            if ref_file is not None:
+                try:
+                    ref_df = pd.read_csv(ref_file)
+                    ref_name = ref_file.name
+                    st.session_state.drift_reference_df = ref_df
+                    st.success(f"✅ 成功加载参考数据: {len(ref_df)} 行 x {len(ref_df.columns)} 列")
+                except Exception as e:
+                    st.error(f"加载失败: {str(e)}")
+
+        st.markdown("---")
+        st.markdown("**待检测数据集 (New)")
+        st.caption("部署后新进来的数据，需要检测是否发生分布偏移的数据")
+        new_option = st.radio(
+            "选择待检测数据来源",
+            options=["使用Pipeline内部测试集", "上传CSV文件"],
+            index=0,
+            key="new_data_source",
+        )
+
+        new_df = None
+        new_name = ""
+
+        if new_option == "使用Pipeline内部测试集":
+            if pipeline.diagnostician and hasattr(pipeline.diagnostician, "X_test") and pipeline.diagnostician.X_test is not None:
+                new_df = pipeline.diagnostician.X_test.copy()
+                new_name = "测试集(诊断划分)"
+                st.success(f"✅ 已加载待检测数据，共 {len(new_df)} 行 {len(new_df.columns)} 列")
+            else:
+                st.warning("⚠️ Pipeline内部暂无测试集，请先完成诊断或上传CSV")
+        else:
+            new_file = st.file_uploader(
+                "上传待检测数据集CSV",
+                type=["csv"],
+                key="new_file_upload",
+            )
+            if new_file is not None:
+                try:
+                    new_df = pd.read_csv(new_file)
+                    new_name = new_file.name
+                    st.session_state.drift_new_df = new_df
+                    st.success(f"✅ 成功加载待检测数据: {len(new_df)} 行 x {len(new_df.columns)} 列")
+                except Exception as e:
+                    st.error(f"加载失败: {str(e)}")
+
+        st.markdown("---")
+
+        storage_path = st.text_input(
+            "告警记录存储路径",
+            value="./drift_alerts.json",
+            key="drift_storage_path",
+        )
+
+        col_run_l, col_run_r = st.columns([1, 1])
+        with col_run_r:
+            run_drift_btn = st.button("🔍 开始漂移检测", type="primary", key="run_drift_button")
+
+    with right_col:
+        alert_banner_displayed = False
+
+        if st.session_state.drift_detection_result:
+            result = st.session_state.drift_detection_result
+            if 'error' in result:
+                st.error(result['error'])
+            else:
+                alert_banner_displayed = True
+                _render_drift_alert_banner(result)
+
+        if (run_drift_btn or st.session_state.drift_detection_result):
+            if run_drift_btn:
+                if ref_df is None or new_df is None:
+                    st.error("❌ 请先选择参考数据集和待检测数据集!")
+                    return
+
+                with st.spinner("正在进行数据漂移检测..."):
+                    try:
+                        feature_col_types = {
+                            col: col_type
+                            for col, col_type in pipeline.column_types.items()
+                            if col != pipeline.target_column
+                        }
+
+                        ref_feature_cols = [
+                            c for c in ref_df.columns
+                            if c in feature_col_types and feature_col_types[c] in ('numeric', 'categorical')
+                        ]
+
+                        ref_filtered = ref_df[ref_feature_cols].copy()
+                        new_feature_cols = [c for c in ref_feature_cols if c in new_df.columns]
+                        new_filtered = new_df[new_feature_cols].copy()
+
+                        if ref_filtered.empty:
+                            st.error("❌ 参考数据集中没有可分析的数值/分类特征，请检查列类型配置。")
+                            return
+
+                        detector = DriftDetector(
+                            reference_data=ref_filtered,
+                            column_types=feature_col_types,
+                        )
+                        result = detector.detect(new_filtered)
+
+                        try:
+                            storage = AlertStorage(storage_path=storage_path)
+                            storage.save_alert(
+                                result,
+                                dataset_name=f"{ref_name}_vs_{new_name}",
+                            )
+                        except Exception:
+                            pass
+
+                        st.session_state.drift_detection_result = result
+
+                        if not alert_banner_displayed:
+                            _render_drift_alert_banner(result)
+
+                    except Exception as e:
+                        st.error(f"漂移检测失败: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+                        return
+
+            result = st.session_state.drift_detection_result
+
+            if not alert_banner_displayed and 'error' not in result:
+                _render_drift_alert_banner(result)
+
+            _render_drift_metrics_overview(result)
+
+            st.markdown("---")
+
+            tab_heatmap, tab_distributions = st.tabs(["🔥 单特征漂移热力图", "📈 分布对比图"])
+
+            with tab_heatmap:
+                _render_drift_heatmap(result)
+
+            with tab_distributions:
+                _render_drift_distribution_plots(result, pipeline)
+
+            st.markdown("---")
+            _render_drift_history(storage_path)
+
+            st.markdown("---")
+            export_c1, export_c2, export_c3 = st.columns([2, 1, 1])
+            with export_c2:
+                if st.button("📄 漂移报告导出", type="primary", key="drift_export_btn"):
+                    _export_drift_report(result)
+            with export_c3:
+                if st.button("➡️ 下一步：导出Pipeline", type="primary", key="drift_next_btn"):
+                    st.session_state.current_step = 7
+                    st.rerun()
+
+
+def _render_drift_alert_banner(result):
+    """渲染顶部告警横幅"""
+    alert_level = result.get('overall_alert_level', 'stable')
+    banner_info = result.get('alert_banner', {})
+    retraining = result.get('retraining_advice', {})
+
+    alert_colors = {
+        'stable': '#d5f5e3',
+        'mild_drift': '#fdebd0',
+        'severe_drift': '#fadbd8',
+    }
+    alert_icons = {
+        'stable': '✅',
+        'mild_drift': '⚠️',
+        'severe_drift': '🚨',
+    }
+    alert_text_colors = {
+        'stable': '#186a3b',
+        'mild_drift': '#9c640c',
+        'severe_drift': '#922b21',
+    }
+
+    color = alert_colors.get(alert_level, '#ecf0f1')
+    icon = alert_icons.get(alert_level, 'ℹ️')
+    text_color = alert_text_colors.get(alert_level, '#2c3e50')
+
+    summary = banner_info.get('summary', '')
+    drifted_features = banner_info.get('drifted_feature_details', [])
+    action = retraining.get('action', 'continue_monitoring')
+    reason = retraining.get('reason', '')
+    urgency = retraining.get('urgency', 'low')
+
+    urgency_badges = {
+        'low': '<span style="background:#a9dfbf; color:#1e8449; padding:2px 8px; border-radius:10px; font-size:11px;">低</span>',
+        'medium': '<span style="background:#fad7a0; color:#ca6f1e; padding:2px 8px; border-radius:10px; font-size:11px;">中</span>',
+        'high': '<span style="background:#f5b7b1; color:#c0392b; padding:2px 8px; border-radius:10px; font-size:11px;">高</span>',
+    }
+    urgency_badge = urgency_badges.get(urgency, '')
+
+    drifted_list_html = ''
+    if drifted_features:
+        items = ''.join([
+            f"<li><strong>{d['feature']}</strong>: {d['direction_desc']}</li>"
+            for d in drifted_features[:15]
+        ])
+        drifted_list_html = f"""
+            <div style="margin-top: 12px;">
+                <details style="cursor: pointer;">
+                    <summary style="font-weight: 600;">🔍 漂移特征详情（{len(drifted_features)}个）
+                    </summary>
+                    <ul style="margin-top: 10px; padding-left: 20px;">
+                        {items}
+                    </ul>
+                </details>
+            </div>
+        """
+
+    html = f"""
+        <div style="
+            background: {color};
+            border-left: 6px solid {text_color};
+            padding: 18px 22px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.08);">
+            <div style="font-size: 20px; font-weight: bold; color: {text_color}; margin-bottom: 10px;">
+                {icon} {banner_info.get('label', '')}
+                &nbsp;&nbsp;{urgency_badge}
+            </div>
+            <div style="font-size: 15px; color: {text_color}; margin-bottom: 12px;">
+                {summary}
+            </div>
+            <div style="background: rgba(255, 255, 255, 0.6);
+                 padding: 12px 16px;
+                 border-radius: 6px;
+                 font-size: 14px;
+                 color: {text_color};">
+                <strong>💡 重训建议：</strong>
+                <span style="margin-left: 8px;">
+                    {reason}
+                </span>
+                <div style="margin-top: 6px;">
+                    <strong>建议动作：</strong>
+                    <span style="margin-left: 8px; font-weight: 600;">
+                        {action}
+                    </span>
+                </div>
+            </div>
+            {drifted_list_html}
+        </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _render_drift_metrics_overview(result):
+    """渲染整体指标卡片"""
+    psi = result.get('overall_psi', 0.0)
+    psi_grade = result.get('overall_psi_grade', 'stable')
+    n_drifted = result.get('n_drifted', 0)
+    n_total = result.get('n_total_features', 0)
+    corrected_thresh = result.get('corrected_p_threshold', 0.05)
+    original_thresh = result.get('original_p_threshold', 0.05)
+
+    grade_cn = {
+        'stable': '✅ 稳定',
+        'mild_drift': '⚠️ 轻度漂移',
+        'severe_drift': '🚨 严重漂移',
+    }
+
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+
+    with col_m1:
+        st.metric(
+            "整体 PSI 数值",
+            f"{psi:.4f}",
+            delta=grade_cn.get(psi_grade, psi_grade),
+            delta_color='inverse' if psi_grade == 'severe_drift' else 'normal',
+        )
+    with col_m2:
+        st.metric("漂移 / 总特征数", f"{n_drifted} / {n_total}")
+
+    with col_m3:
+        drift_pct = (n_drifted / n_total * 100) if n_total > 0 else 0
+        st.metric("漂移特征占比", f"{drift_pct:.1f}%")
+
+    with col_m4:
+        st.metric(
+            "Bonferroni 校正阈值",
+            f"{corrected_thresh:.2e}",
+            delta=f"原始: {original_thresh} ÷ {n_total} 特征",
+        )
+
+
+def _render_drift_heatmap(result):
+    """渲染单特征漂移热力图"""
+    st.subheader("🔥 单特征漂移热力图")
+    st.caption("颜色越深表示漂移越显著，灰色表示未检测到显著漂移")
+
+    feature_tests = result.get('feature_tests', {})
+    feature_psi = result.get('feature_psi', {})
+
+    if not feature_tests:
+        st.info("暂无特征检验数据")
+        return
+
+    rows = []
+    for feat, test in feature_tests.items():
+        psi_info = feature_psi.get(feat, {})
+        p_val = test.get('p_value', 1.0)
+        stat = test.get('statistic', 0.0)
+        is_drifted = test.get('is_drifted', False)
+        psi_val = psi_info.get('psi_value', 0.0) if np.isfinite(psi_info.get('psi_value', 0.0)) else 0.0
+        direction = test.get('direction', 'none')
+        test_type = test.get('test', '')
+        ftype = '数值型' if test_type == 'ks_2samp' else '分类型'
+
+        if direction == 'mean_increase':
+            dir_text = '均值上升'
+        elif direction == 'mean_decrease':
+            dir_text = '均值下降'
+        elif 'category_' in direction:
+            dir_text = '类别占比变化'
+        else:
+            dir_text = '无显著方向'
+
+        rows.append({
+            '特征名': feat,
+            '类型': ftype,
+            '检验方法': test_type,
+            '统计量': round(stat, 4),
+            'p值': f"{p_val:.3g}",
+            'PSI值': round(psi_val, 4),
+            '是否漂移': '是' if is_drifted else '否',
+            '漂移方向': dir_text,
+            '-log10(p值)': round(-np.log10(max(p_val, 1e-20)) if p_val > 0 else 20, 2),
+        })
+
+    df_heatmap = pd.DataFrame(rows)
+
+    heatmap_cols = ['特征名', '类型', '检验方法', '统计量', 'p值', 'PSI值', '是否漂移', '漂移方向']
+    display_df = df_heatmap[heatmap_cols].copy()
+
+    display_df = display_df.sort_values(
+        by=['是否漂移', 'PSI值'],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+    def highlight_rows(s):
+        if s['是否漂移'] == '是':
+            return ['background-color: #fadbd8'] * len(s)
+        return [''] * len(s)
+
+    styled = display_df.style.apply(highlight_rows, axis=1)
+
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        height=min(600, len(display_df) * 35 + 50),
+    )
+
+    st.markdown("---")
+
+    st.caption("💡 说明：")
+    st.markdown("- **p值** < Bonferroni校正阈值的特征被判定为显著漂移（标红高亮显示）")
+    st.markdown("- **PSI值**: < 0.1 稳定，0.1~0.25 轻度漂移，>0.25 严重漂移")
+
+
+def _render_drift_distribution_plots(result, pipeline):
+    """渲染分布对比图"""
+    st.subheader("📈 漂移特征分布对比")
+    st.caption("参考分布(蓝色) vs 新数据分布(橙色) 直方图叠加对比")
+
+    dist_data = result.get('distribution_data', {})
+    drifted = result.get('drifted_features', [])
+
+    if not dist_data:
+        st.info("暂无分布数据")
+        return
+
+    features_to_show = drifted if drifted else list(dist_data.keys())
+
+    if not features_to_show:
+        st.info("无可绘图特征")
+        return
+
+    n_cols = 2
+    n_features = min(len(features_to_show), 10)
+    n_rows = (n_features + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(14, 5 * n_rows),
+    )
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+
+    for idx, feat in enumerate(features_to_show[:10]):
+        row_idx = idx // n_cols
+        col_idx = idx % n_cols
+        ax = axes[row_idx, col_idx]
+        data = dist_data.get(feat, {})
+        ftype = data.get('type', 'numeric')
+
+        if ftype == 'numeric':
+            ref_hist = data.get('reference', {}).get('hist', np.array([]))
+            ref_edges = data.get('reference', {}).get('edges', np.array([]))
+            new_hist = data.get('new', {}).get('hist', np.array([]))
+            new_edges = data.get('new', {}).get('edges', np.array([]))
+
+            if len(ref_hist) > 0 and len(ref_edges) > 1:
+                width_ref = np.diff(ref_edges)
+                width_new = np.diff(new_edges) if len(new_edges) > 1 else width_ref
+
+                ax.bar(
+                    ref_edges[:-1],
+                    ref_hist,
+                    width=width_ref,
+                    alpha=0.5,
+                    label='参考分布',
+                    color='#3498db',
+                    edgecolor='white',
+                )
+                new_offset = (width_new[0] / 2) if len(new_hist) > 0 else 0
+                ax.bar(
+                    new_edges[:-1] + new_offset,
+                    new_hist,
+                    width=width_new,
+                    alpha=0.5,
+                    label='新分布',
+                    color='#e67e22',
+                    edgecolor='white',
+                )
+
+            ref_mean = data.get('reference', {}).get('mean', 0)
+            new_mean = data.get('new', {}).get('mean', 0)
+            ax.axvline(
+                ref_mean,
+                color='#2980b9',
+                linestyle='--',
+                linewidth=2,
+                label=f'参考均值: {ref_mean:.3f}',
+            )
+            ax.axvline(
+                new_mean,
+                color='#d35400',
+                linestyle='--',
+                linewidth=2,
+                label=f'新均值: {new_mean:.3f}',
+            )
+            ax.legend(fontsize=8)
+            ax.set_xlabel(feat)
+            ax.set_ylabel('密度')
+            ax.grid(True, alpha=0.3)
+
+        else:
+            cats = data.get('reference', {}).get('categories', [])
+            ref_props = data.get('reference', {}).get('proportions', [])
+            new_props = data.get('new', {}).get('proportions', [])
+
+            if cats:
+                x = np.arange(len(cats))
+                width = 0.35
+                ax.bar(
+                    x - width / 2,
+                    ref_props,
+                    width=width,
+                    alpha=0.7,
+                    label='参考分布',
+                    color='#3498db',
+                )
+                ax.bar(
+                    x + width / 2,
+                    new_props,
+                    width=width,
+                    alpha=0.7,
+                    label='新分布',
+                    color='#e67e22',
+                )
+                ax.set_xticks(x)
+                ax.set_xticklabels(
+                    [str(c)[:12] for c in cats],
+                    rotation=45,
+                    ha='right',
+                    fontsize=8,
+                )
+                ax.legend(fontsize=8)
+                ax.set_xlabel(feat)
+                ax.set_ylabel('占比')
+                ax.grid(True, alpha=0.3, axis='y')
+
+    for idx in range(len(features_to_show[:10]), n_rows * n_cols):
+        row_idx = idx // n_cols
+        col_idx = idx % n_cols
+        axes[row_idx, col_idx].axis('off')
+
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def _render_drift_history(storage_path: str):
+    """渲染历史告警记录"""
+    st.subheader("📜 历史告警记录")
+
+    try:
+        storage = AlertStorage(storage_path)
+        history = storage.get_all_alerts(limit=50)
+
+        if not history:
+            st.info("暂无历史告警记录")
+            return
+
+        history_df = pd.DataFrame(history)
+
+        level_map = {
+            'stable': '✅ 稳定',
+            'mild_drift': '⚠️ 轻度',
+            'severe_drift': '🚨 严重',
+        }
+        urgency_map = {
+            'low': '低',
+            'medium': '中',
+            'high': '高',
+        }
+        action_map = {
+            'continue_monitoring': '继续监控',
+            'monitor_closely': '密切监控',
+            'consider_retrain': '考虑重训',
+            'retrain_immediately': '立即重训',
+        }
+
+        display_cols = [
+            'timestamp', 'dataset_name',
+            'overall_alert_level',
+            'overall_psi',
+            'n_drifted',
+            'n_total_features',
+            'retraining_action',
+            'retraining_urgency',
+        ]
+
+        if all(c in history_df.columns for c in display_cols):
+            history_disp = history_df[display_cols].copy()
+            history_disp.columns = [
+                '检测时间',
+                '数据集',
+                '告警级别',
+                'PSI',
+                '漂移特征数',
+                '总特征数',
+                '建议动作',
+                '紧急度',
+            ]
+            history_disp['告警级别'] = history_disp['告警级别'].map(level_map).fillna(history_disp['告警级别'])
+            history_disp['建议动作'] = history_disp['建议动作'].map(action_map).fillna(history_disp['建议动作'])
+            history_disp['紧急度'] = history_disp['紧急度'].map(urgency_map).fillna(history_disp['紧急度'])
+            history_disp['PSI'] = history_disp['PSI'].round(4)
+
+            st.dataframe(
+                history_disp,
+                use_container_width=True,
+                height=min(300, len(history_disp) * 35 + 50),
+            )
+
+    except Exception as e:
+        st.info(f"读取历史记录暂不可用: {str(e)}")
+
+
+def _export_drift_report(result):
+    """导出漂移检测报告"""
+    try:
+        exporter = DriftReportExporter(result)
+
+        html_content = exporter.export_html()
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"drift_report_{timestamp}.html"
+
+        st.success(f"✅ 报告已生成: {filename}")
+
+        st.download_button(
+            label="💾 下载 HTML 报告",
+            data=html_content,
+            file_name=filename,
+            mime="text/html",
+            key="download_drift_report",
+        )
+
+    except Exception as e:
+        st.error(f"报告生成失败: {str(e)}")
+
+
 def step_export():
-    """步骤6: Pipeline导出"""
+    """步骤8: Pipeline导出"""
     st.title("📦 Pipeline导出")
     st.markdown("导出完整的可复用Pipeline，支持多种格式。")
 
@@ -1807,6 +2440,7 @@ def main():
         step_model_selection,
         step_model_diagnosis,
         step_interpretability,
+        step_drift_detection,
         step_export,
     ]
 

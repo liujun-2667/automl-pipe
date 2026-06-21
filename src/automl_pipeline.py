@@ -18,6 +18,7 @@ from src.model_selector import AutoModelSelector
 from src.model_diagnosis import ModelDiagnostician
 from src.pipeline_exporter import PipelineExporter
 from src.interpretability import ModelInterpretabilityAnalyzer
+from src.drift_detection import DriftDetector, AlertStorage
 
 warnings.filterwarnings('ignore')
 
@@ -46,6 +47,8 @@ class AutoMLPipeline:
         self.model_selector = None
         self.diagnostician = None
         self.interpretability_analyzer = None
+        self.drift_detector = None
+        self.alert_storage = None
         self.exporter = None
 
         self.X_full = None
@@ -59,6 +62,7 @@ class AutoMLPipeline:
         self.is_feature_engineered = False
         self.is_feature_selected = False
         self.is_model_trained = False
+        self.is_drift_detected = False
 
     def load_data(self, df: pd.DataFrame) -> Dict:
         """加载数据并初始化"""
@@ -298,6 +302,78 @@ class AutoMLPipeline:
 
         return result
 
+    def run_drift_detection(
+        self,
+        reference_data: Optional[pd.DataFrame] = None,
+        new_data: Optional[pd.DataFrame] = None,
+        storage_path: str = './drift_alerts.json',
+        dataset_name: str = 'unknown',
+        save_alert: bool = True,
+    ) -> Dict:
+        """运行数据漂移检测
+
+        Args:
+            reference_data: 参考数据集(通常是训练时的验证集)。如果为None则尝试使用diagnostician的X_test
+            new_data: 待检测的新数据集。如果为None且reference_data已指定，则用validation集作为新数据做基线
+            storage_path: 告警持久化存储的JSON文件路径
+            dataset_name: 数据集名称(用于存储告警记录)
+            save_alert: 是否将检测结果持久化存储
+
+        Returns:
+            完整的漂移检测结果字典
+        """
+        if reference_data is None:
+            if self.diagnostician and hasattr(self.diagnostician, 'X_train') and self.diagnostician.X_train is not None:
+                reference_data = self.diagnostician.X_train
+            elif self.X_full is not None:
+                reference_data = self.X_full
+
+        if reference_data is None:
+            return {'error': '未提供参考数据集，且无法从Pipeline内部获取'}
+
+        feature_column_types = {
+            col: col_type
+            for col, col_type in self.column_types.items()
+            if col != self.target_column
+        }
+
+        ref_feature_cols = [
+            c for c in reference_data.columns
+            if c in feature_column_types and feature_column_types[c] in ('numeric', 'categorical')
+        ]
+        reference_data_filtered = reference_data[ref_feature_cols].copy()
+
+        self.drift_detector = DriftDetector(
+            reference_data=reference_data_filtered,
+            column_types=feature_column_types,
+        )
+
+        if new_data is None:
+            if self.diagnostician and hasattr(self.diagnostician, 'X_test') and self.diagnostician.X_test is not None:
+                new_data = self.diagnostician.X_test
+            elif self.X_full is not None:
+                new_data = self.X_full
+
+        if new_data is None:
+            return {'error': '未提供待检测数据集，且无法从Pipeline内部获取'}
+
+        new_feature_cols = [c for c in ref_feature_cols if c in new_data.columns]
+        new_data_filtered = new_data[new_feature_cols].copy()
+
+        detection_result = self.drift_detector.detect(new_data_filtered)
+
+        if save_alert:
+            try:
+                self.alert_storage = AlertStorage(storage_path=storage_path)
+                self.alert_storage.save_alert(detection_result, dataset_name=dataset_name)
+            except Exception:
+                pass
+
+        self.is_drift_detected = True
+        self._last_drift_result = detection_result
+
+        return detection_result
+
     def export_pipeline(
         self,
         output_dir: str,
@@ -368,3 +444,146 @@ class AutoMLPipeline:
         if self.model_selector:
             return self.model_selector.get_progress()
         return {}
+
+    def run(
+        self,
+        df: pd.DataFrame,
+        target_column: str,
+        task_type: str = 'binary',
+        sample_size: int = 10000,
+        text_strategy: str = 'tfidf',
+        enable_poly_cross: bool = True,
+        corr_threshold: float = 0.95,
+        max_tfidf_features: int = 100,
+        n_bins: int = 5,
+        n_methods_required: int = 2,
+        n_estimators: int = 100,
+        n_features: Optional[int] = None,
+        auto: bool = True,
+        auto_threshold: float = 0.8,
+        n_trials: int = 30,
+        cv: int = 5,
+        interpretability_output_dir: str = './output',
+        enable_drift_detection: bool = True,
+        drift_reference_data: Optional[pd.DataFrame] = None,
+        drift_storage_path: str = './drift_alerts.json',
+        progress_callback: Optional[Callable] = None,
+    ) -> Dict:
+        """一站式运行完整Pipeline
+
+        Args:
+            df: 输入数据集
+            target_column: 目标列名
+            task_type: 任务类型 binary/multiclass/regression
+            sample_size: 快速实验子集大小
+            text_strategy: 文本处理策略
+            enable_poly_cross: 是否启用多项式交叉
+            corr_threshold: 高相关过滤阈值
+            max_tfidf_features: TF-IDF最大特征数
+            n_bins: 数值分箱档数
+            n_methods_required: 特征选择最少方法数
+            n_estimators: 随机森林树数量
+            n_features: 手动指定保留特征数
+            auto: 自动选择特征数
+            auto_threshold: 累计重要性阈值
+            n_trials: 每个模型试验次数
+            cv: 交叉验证折数
+            interpretability_output_dir: 可解释性输出目录
+            enable_drift_detection: 是否启用漂移检测
+            drift_reference_data: 漂移检测参考数据集(通常为训练集)。
+                如果传入了该参数，训练结束后会自动运行一次漂移检测(用验证集作为新数据)。
+            drift_storage_path: 告警持久化存储路径
+            progress_callback: 进度回调函数
+
+        Returns:
+            包含所有步骤结果的综合字典
+        """
+        all_results = {}
+
+        if progress_callback:
+            progress_callback("[1/7] 加载数据并初始化...")
+        self.load_data(df)
+        is_valid, msg = self.validate_target(target_column, task_type)
+        if not is_valid:
+            return {'error': msg}
+        prep_res = self.prepare_datasets(sample_size=sample_size)
+        all_results['prepare'] = prep_res
+
+        if progress_callback:
+            progress_callback("[2/7] 自动特征工程...")
+        fe_res = self.run_feature_engineering(
+            text_strategy=text_strategy,
+            enable_poly_cross=enable_poly_cross,
+            corr_threshold=corr_threshold,
+            max_tfidf_features=max_tfidf_features,
+            n_bins=n_bins,
+        )
+        all_results['feature_engineering'] = fe_res
+
+        if progress_callback:
+            progress_callback("[3/7] 特征重要性评估与选择...")
+        fs_res = self.run_feature_selection(
+            n_methods_required=n_methods_required,
+            n_estimators=n_estimators,
+            n_features=n_features,
+            auto=auto,
+            auto_threshold=auto_threshold,
+        )
+        all_results['feature_selection'] = fs_res
+
+        if progress_callback:
+            progress_callback("[4/7] 自动模型选择...")
+        ms_res = self.run_model_selection(
+            n_trials=n_trials,
+            cv=cv,
+            progress_callback=progress_callback,
+        )
+        all_results['model_selection'] = ms_res
+
+        if progress_callback:
+            progress_callback("[5/7] 模型诊断...")
+        diag_res = self.run_diagnosis()
+        all_results['diagnosis'] = diag_res
+
+        if progress_callback:
+            progress_callback("[6/7] 模型可解释性分析...")
+        try:
+            interp_res = self.run_interpretability(output_dir=interpretability_output_dir)
+            all_results['interpretability'] = interp_res
+        except Exception as e:
+            all_results['interpretability'] = {'error': str(e)}
+
+        if enable_drift_detection:
+            if progress_callback:
+                progress_callback("[6.5/7] 数据漂移检测...")
+            try:
+                ref_data = drift_reference_data
+                new_data = None
+                dataset_name = 'training_baseline'
+
+                if ref_data is not None:
+                    if self.diagnostician and hasattr(self.diagnostician, 'X_test') and self.diagnostician.X_test is not None:
+                        new_data = self.diagnostician.X_test
+                else:
+                    if self.diagnostician and hasattr(self.diagnostician, 'X_train') and self.diagnostician.X_train is not None:
+                        ref_data = self.diagnostician.X_train
+                        if hasattr(self.diagnostician, 'X_test') and self.diagnostician.X_test is not None:
+                            new_data = self.diagnostician.X_test
+
+                if ref_data is not None:
+                    drift_res = self.run_drift_detection(
+                        reference_data=ref_data,
+                        new_data=new_data,
+                        storage_path=drift_storage_path,
+                        dataset_name=dataset_name,
+                        save_alert=True,
+                    )
+                    all_results['drift_detection'] = drift_res
+            except Exception as e:
+                all_results['drift_detection'] = {'error': str(e)}
+
+        all_results['success'] = True
+        all_results['best_model_name'] = ms_res.get('best_model_name', '')
+        all_results['best_score'] = ms_res.get('best_score', 0.0)
+
+        return all_results
