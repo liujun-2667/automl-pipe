@@ -36,8 +36,55 @@ st.set_page_config(
 )
 
 sns.set_style("whitegrid")
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
+
+
+_CN_FONT_PROP = None
+
+
+def _apply_cn_font():
+    """为 matplotlib 动态探测并应用可用中文字体,避免中文显示为方框。
+
+    Returns:
+        matplotlib.font_manager.FontProperties: 可直接传给 set_title / set_xlabel
+            等方法的字体属性对象(绑定到实际存在的字体文件)。
+    """
+    global _CN_FONT_PROP
+    import matplotlib.font_manager as fm
+    # 按优先级列出常见中文字体的 matplotlib family 名
+    candidates = [
+        'Microsoft YaHei', 'SimHei', 'Noto Sans SC', 'SimSun',
+        'KaiTi', 'FangSong', 'Microsoft JhengHei',
+        'Noto Sans CJK SC', 'Source Han Sans SC', 'WenQuanYi Zen Hei',
+    ]
+    available = {f.name for f in fm.fontManager.ttflist}
+    chosen = [f for f in candidates if f in available]
+    fallback = ['DejaVu Sans']
+    plt.rcParams['font.sans-serif'] = (chosen or fallback) + fallback
+    plt.rcParams['axes.unicode_minus'] = False
+
+    if _CN_FONT_PROP is None and chosen:
+        try:
+            # 找到第一个可用中文字体对应的实际字体文件,绑定到 FontProperties
+            target_name = chosen[0]
+            for f in fm.fontManager.ttflist:
+                if f.name == target_name:
+                    _CN_FONT_PROP = fm.FontProperties(fname=f.fname)
+                    break
+        except Exception:
+            _CN_FONT_PROP = None
+
+    return _CN_FONT_PROP
+
+
+_CN_FONT = _apply_cn_font()
+
+
+def _cn_fp():
+    """返回已缓存的中文字体 FontProperties,若未初始化则立刻探测。"""
+    global _CN_FONT
+    if _CN_FONT is None:
+        _CN_FONT = _apply_cn_font()
+    return _CN_FONT
 
 
 def init_session_state():
@@ -92,6 +139,8 @@ def init_session_state():
         st.session_state.drift_last_ref_df = None
     if 'drift_last_new_df' not in st.session_state:
         st.session_state.drift_last_new_df = None
+    if 'drift_last_auto_run_ts' not in st.session_state:
+        st.session_state.drift_last_auto_run_ts = 0.0
     if 'is_running' not in st.session_state:
         st.session_state.is_running = False
 
@@ -2022,9 +2071,32 @@ def step_drift_detection():
     if (st.session_state.drift_detection_mode == 'sliding'
             and st.session_state.drift_auto_monitoring
             and st.session_state.drift_monitor is not None):
-        if st.session_state.drift_monitor.can_slide():
-            time.sleep(int(st.session_state.drift_auto_interval))
-            st.rerun()
+        monitor = st.session_state.drift_monitor
+        if monitor.can_slide():
+            interval_sec = int(st.session_state.drift_auto_interval)
+            now_ts = time.time()
+            last_ts = st.session_state.get('drift_last_auto_run_ts', 0.0)
+            should_trigger = (now_ts - last_ts) >= max(interval_sec - 1, 1)
+            if should_trigger:
+                monitor.slide()
+                _run_window_detection(monitor, storage_path, ref_name, new_name)
+                st.session_state.drift_last_auto_run_ts = now_ts
+            js_refresh = f"""
+            <script>
+                setTimeout(function() {{
+                    if (!window.__driftAutoStop) {{
+                        window.location.reload();
+                    }}
+                }}, {interval_sec * 1000});
+                window.__driftAutoStop = false;
+            </script>
+            <div style="font-size:12px;color:#555;padding:4px 8px;border:1px dashed #ccc;border-radius:4px;">
+                ⏱️ 自动监控中,每 {interval_sec} 秒自动滑动一次窗口并执行检测。
+                点击上方"自动监控"开关可随时停止。
+            </div>
+            """
+            import streamlit.components.v1 as components
+            components.html(js_refresh, height=40)
         else:
             st.session_state.drift_auto_monitoring = False
 
@@ -2157,6 +2229,7 @@ def _render_sliding_window_controls(pipeline, ref_df, new_df, ref_name, new_name
         st.session_state.drift_window_result = None
         st.session_state.drift_weighted_psi = None
         st.session_state.drift_auto_monitoring = False
+        st.session_state.drift_last_auto_run_ts = 0.0
         st.rerun()
 
     triggered = False
@@ -2167,15 +2240,17 @@ def _render_sliding_window_controls(pipeline, ref_df, new_df, ref_name, new_name
         if monitor.slide():
             triggered = _run_window_detection(monitor, storage_path, ref_name, new_name)
         else:
-            st.warning("已到达数据流末尾，无法继续滑动")
+            st.warning("已到达数据流末尾,无法继续滑动")
 
     if st.session_state.drift_auto_monitoring:
         if monitor.can_slide():
-            monitor.slide()
-            _run_window_detection(monitor, storage_path, ref_name, new_name)
+            st.caption(
+                f"⏱️ 自动监控中:下一次检测将在 "
+                f"{int(st.session_state.drift_auto_interval)} 秒后自动执行"
+            )
         else:
             st.session_state.drift_auto_monitoring = False
-            st.info("数据流已全部检测完毕，自动监控已停止")
+            st.info("数据流已全部检测完毕,自动监控已停止")
 
     return triggered
 
@@ -2209,13 +2284,15 @@ def _run_window_detection(monitor, storage_path, ref_name, new_name):
 
 
 def _render_drift_trend_chart(tracker, n_total_features):
-    """渲染漂移趋势追踪图：PSI折线 + 漂移特征数柱状 + 参考线 + 警戒区间阴影"""
+    """渲染漂移趋势追踪图:PSI折线 + 漂移特征数柱状 + 参考线 + 警戒区间阴影"""
+    _apply_cn_font()
+    fp = _cn_fp()
     st.subheader("📊 漂移趋势追踪")
-    st.caption("横轴为检测序号，左纵轴为PSI值(折线)，右纵轴为漂移特征数(柱状)")
+    st.caption("横轴为检测序号,左纵轴为PSI值(折线),右纵轴为漂移特征数(柱状)")
 
     records = tracker.get_records()
     if not records:
-        st.info("暂无趋势数据，请先执行检测（全量检测或滑动窗口检测均会记录）")
+        st.info("暂无趋势数据,请先执行检测(全量检测或滑动窗口检测均会记录)")
         return
 
     seqs = [r['seq'] for r in records]
@@ -2237,9 +2314,12 @@ def _render_drift_trend_chart(tracker, n_total_features):
                 label='稳定线 PSI=0.1')
     ax1.axhline(y=0.25, color='orange', linestyle='--', linewidth=1.5,
                 label='警戒线 PSI=0.25')
-    ax1.set_xlabel('检测序号')
-    ax1.set_ylabel('PSI值', color='#2980b9')
+    ax1.set_xlabel('检测序号', fontproperties=fp)
+    ax1.set_ylabel('PSI值', color='#2980b9', fontproperties=fp)
     ax1.tick_params(axis='y', labelcolor='#2980b9')
+    for label in ax1.get_xticklabels() + ax1.get_yticklabels():
+        if fp is not None:
+            label.set_fontproperties(fp)
 
     ax2 = ax1.twinx()
     ax2.bar(seqs, n_drifted, alpha=0.3, color='#e74c3c', width=0.5,
@@ -2247,13 +2327,17 @@ def _render_drift_trend_chart(tracker, n_total_features):
     if retrain_line > 0:
         ax2.axhline(y=retrain_line, color='red', linestyle='--', linewidth=1.5,
                     label=f'重训线 特征数={retrain_line:.1f}')
-    ax2.set_ylabel('漂移特征数量', color='#e74c3c')
+    ax2.set_ylabel('漂移特征数量', color='#e74c3c', fontproperties=fp)
     ax2.tick_params(axis='y', labelcolor='#e74c3c')
+    for label in ax2.get_yticklabels():
+        if fp is not None:
+            label.set_fontproperties(fp)
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
-    ax1.set_title('漂移趋势追踪')
+    legend = ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8,
+                        prop=fp)
+    ax1.set_title('漂移趋势追踪', fontproperties=fp, fontsize=14)
     ax1.grid(True, alpha=0.3)
     plt.tight_layout()
     st.pyplot(fig)
@@ -2395,6 +2479,8 @@ def _render_drift_drilldown_panel():
 
 def _render_drift_drilldown_detail(drill):
     """渲染单个特征的下钻详情内容"""
+    _apply_cn_font()
+    fp = _cn_fp()
     col_type = drill.get('type', '')
 
     if col_type == 'numeric':
@@ -2431,10 +2517,14 @@ def _render_drift_drilldown_detail(drill):
             ax.plot(grid, kde['new_density'], label='新数据', color='#e67e22', linewidth=2)
             ax.fill_between(grid, kde['ref_density'], alpha=0.2, color='#2980b9')
             ax.fill_between(grid, kde['new_density'], alpha=0.2, color='#e67e22')
-            ax.set_xlabel(drill.get('feature', ''))
-            ax.set_ylabel('密度')
-            ax.set_title(f"{drill.get('feature', '')} KDE密度曲线叠加")
-            ax.legend()
+            ax.set_xlabel(drill.get('feature', ''), fontproperties=fp)
+            ax.set_ylabel('密度', fontproperties=fp)
+            ax.set_title(f"{drill.get('feature', '')} KDE密度曲线叠加",
+                         fontproperties=fp, fontsize=13)
+            ax.legend(prop=fp)
+            for label in ax.get_xticklabels() + ax.get_yticklabels():
+                if fp is not None:
+                    label.set_fontproperties(fp)
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
             st.pyplot(fig)
@@ -2460,7 +2550,7 @@ def _render_drift_drilldown_detail(drill):
 
         waterfall = drill.get('waterfall', [])
         if waterfall:
-            st.markdown("**类别占比变化瀑布图**（参考占比 → 新占比的增减）")
+            st.markdown("**类别占比变化瀑布图**(参考占比 → 新占比的增减)")
             top_n = min(len(waterfall), 15)
             wf = waterfall[:top_n]
             cats = [str(w['category'])[:15] for w in wf]
@@ -2479,10 +2569,14 @@ def _render_drift_drilldown_detail(drill):
                     ax.bar(i, abs(delta), bottom=ref_p + delta, color='#e74c3c',
                            alpha=0.85, width=0.6, label='占比减少' if i == 0 else None)
             ax.set_xticks(x)
-            ax.set_xticklabels(cats, rotation=45, ha='right', fontsize=9)
-            ax.set_ylabel('占比')
-            ax.set_title(f"{drill.get('feature', '')} 类别占比变化瀑布图")
-            ax.legend(loc='upper right', fontsize=9)
+            ax.set_xticklabels(cats, rotation=45, ha='right', fontsize=9, fontproperties=fp)
+            ax.set_ylabel('占比', fontproperties=fp)
+            ax.set_title(f"{drill.get('feature', '')} 类别占比变化瀑布图",
+                         fontproperties=fp, fontsize=13)
+            ax.legend(loc='upper right', fontsize=9, prop=fp)
+            for label in ax.get_yticklabels():
+                if fp is not None:
+                    label.set_fontproperties(fp)
             ax.grid(True, alpha=0.3, axis='y')
             plt.tight_layout()
             st.pyplot(fig)
