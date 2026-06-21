@@ -76,6 +76,7 @@ class DriftDetector:
         )
 
         self._precompute_reference_bins()
+        self._last_drift_result: Optional[Dict] = None
 
     def _precompute_reference_bins(self):
         """预计算参考数据集的分桶边界(用于PSI)"""
@@ -360,16 +361,22 @@ class DriftDetector:
         self,
         psi_grade: str,
         drifted_feature_count: int,
+        total_features: int,
     ) -> str:
         """综合PSI和单特征检测结果，确定最终告警级别"""
         psi_level = self._grade_level(psi_grade)
         final_level = psi_level
+
+        drift_ratio = drifted_feature_count / max(total_features, 1)
 
         if drifted_feature_count >= 3 and psi_level == 0:
             final_level = max(final_level, 1)
 
         if drifted_feature_count >= 5 and psi_level <= 1:
             final_level = max(final_level, 1)
+
+        if drift_ratio >= 0.3 and psi_level <= 1:
+            final_level = max(final_level, 2)
 
         level_to_grade = {0: 'stable', 1: 'mild_drift', 2: 'severe_drift'}
         return level_to_grade.get(final_level, 'stable')
@@ -406,12 +413,18 @@ class DriftDetector:
                     f'检测到轻度漂移: {drifted_feature_count}/{total_features} 个特征漂移 '
                     f'({drift_ratio:.0%}), PSI={psi_value:.4f}。建议密切监控，暂无需立即重训'
                 )
+            elif drift_ratio >= 0.3:
+                advice['action'] = 'retrain_immediately'
+                advice['urgency'] = 'high'
+                advice['reason'] = (
+                    f'漂移特征占比过高: {drifted_feature_count}/{total_features} 个特征漂移 '
+                    f'({drift_ratio:.0%}, 超过30%阈值), PSI={psi_value:.4f}。建议立即重新训练模型!'
+                )
             else:
                 advice['action'] = 'consider_retrain'
                 advice['urgency'] = 'medium'
                 advice['reason'] = (
-                    f'漂移特征占比偏高或PSI接近阈值: '
-                    f'{drifted_feature_count}/{total_features} 个特征漂移 ({drift_ratio:.0%}), '
+                    f'PSI接近阈值: {drifted_feature_count}/{total_features} 个特征漂移 ({drift_ratio:.0%}), '
                     f'PSI={psi_value:.4f}。建议准备重训'
                 )
         else:
@@ -471,7 +484,7 @@ class DriftDetector:
             v['psi_value'] for v in feature_psi.values()
             if np.isfinite(v['psi_value'])
         ]
-        overall_psi = float(np.mean(psi_values)) if psi_values else 0.0
+        overall_psi = self._compute_overall_psi(psi_values) if psi_values else 0.0
         overall_psi_grade = self._psi_grade(overall_psi)
 
         drifted_features = []
@@ -493,7 +506,7 @@ class DriftDetector:
         n_total = len(common_features)
 
         overall_alert_level = self._combine_alerts(
-            overall_psi_grade, n_drifted
+            overall_psi_grade, n_drifted, n_total
         )
 
         alert_banner = self._build_alert_banner(
@@ -524,7 +537,36 @@ class DriftDetector:
             'distribution_data': distribution_data,
         }
 
+        self._last_drift_result = result
+
         return result
+
+    @staticmethod
+    def _compute_overall_psi(psi_values: List[float]) -> float:
+        """计算整体PSI，避免单个严重漂移被平均稀释
+
+        计算逻辑:
+        1. 简单均值 (mean_psi) - 反映整体漂移程度
+        2. 最大值加权 (max_psi * 0.5) - 反映局部最严重漂移
+        3. 第75百分位数 (p75_psi) - 反映多数特征的漂移水平
+        取三者中的最大值作为整体PSI，确保局部严重漂移能被反映
+
+        Args:
+            psi_values: 各特征PSI值列表
+
+        Returns:
+            综合整体PSI值
+        """
+        if not psi_values:
+            return 0.0
+
+        psi_arr = np.array(psi_values)
+        mean_psi = float(np.mean(psi_arr))
+        max_psi = float(np.max(psi_arr))
+        p75_psi = float(np.percentile(psi_arr, 75))
+
+        overall = float(max(mean_psi, max_psi * 0.5, p75_psi))
+        return overall
 
     def _get_distribution_data(self, col: str, new_series: pd.Series) -> Dict:
         """获取分布对比数据(用于绘图)"""

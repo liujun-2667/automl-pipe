@@ -501,7 +501,7 @@ class AutoMLPipeline:
         all_results = {}
 
         if progress_callback:
-            progress_callback("[1/7] 加载数据并初始化...")
+            progress_callback("[1/8] 加载数据并初始化...")
         self.load_data(df)
         is_valid, msg = self.validate_target(target_column, task_type)
         if not is_valid:
@@ -510,7 +510,7 @@ class AutoMLPipeline:
         all_results['prepare'] = prep_res
 
         if progress_callback:
-            progress_callback("[2/7] 自动特征工程...")
+            progress_callback("[2/8] 自动特征工程...")
         fe_res = self.run_feature_engineering(
             text_strategy=text_strategy,
             enable_poly_cross=enable_poly_cross,
@@ -521,7 +521,7 @@ class AutoMLPipeline:
         all_results['feature_engineering'] = fe_res
 
         if progress_callback:
-            progress_callback("[3/7] 特征重要性评估与选择...")
+            progress_callback("[3/8] 特征重要性评估与选择...")
         fs_res = self.run_feature_selection(
             n_methods_required=n_methods_required,
             n_estimators=n_estimators,
@@ -532,7 +532,7 @@ class AutoMLPipeline:
         all_results['feature_selection'] = fs_res
 
         if progress_callback:
-            progress_callback("[4/7] 自动模型选择...")
+            progress_callback("[4/8] 自动模型选择...")
         ms_res = self.run_model_selection(
             n_trials=n_trials,
             cv=cv,
@@ -541,12 +541,12 @@ class AutoMLPipeline:
         all_results['model_selection'] = ms_res
 
         if progress_callback:
-            progress_callback("[5/7] 模型诊断...")
+            progress_callback("[5/8] 模型诊断...")
         diag_res = self.run_diagnosis()
         all_results['diagnosis'] = diag_res
 
         if progress_callback:
-            progress_callback("[6/7] 模型可解释性分析...")
+            progress_callback("[6/8] 模型可解释性分析...")
         try:
             interp_res = self.run_interpretability(output_dir=interpretability_output_dir)
             all_results['interpretability'] = interp_res
@@ -555,7 +555,7 @@ class AutoMLPipeline:
 
         if enable_drift_detection:
             if progress_callback:
-                progress_callback("[6.5/7] 数据漂移检测...")
+                progress_callback("[7/8] 数据漂移检测...")
             try:
                 ref_data = drift_reference_data
                 new_data = None
