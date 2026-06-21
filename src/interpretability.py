@@ -743,25 +743,87 @@ class AdversarialExplainer:
                     return 0.0
 
             base_tau = 1.0
-            tau_drops = []
 
-            for feat in self.feature_names:
+            # 性能优化：一次性生成所有特征的扰动样本，用同一个解释器批量计算
+            perturbed_samples = []
+            feat_indices = []
+
+            for i, feat in enumerate(self.feature_names):
                 try:
                     perturbed_sample = self._perturb_single_feature(sample_idx, feat)
-                    X_with_perturbed = pd.concat([self.X, perturbed_sample], ignore_index=True)
-                    perturbed_idx = len(X_with_perturbed) - 1
+                    perturbed_samples.append(perturbed_sample)
+                    feat_indices.append(i)
+                except Exception:
+                    continue
 
-                    perturbed_interpreter = LocalInterpreter(
-                        self.model, X_with_perturbed, self.task_type,
-                        self.feature_names, self.random_state
-                    )
+            if not perturbed_samples:
+                return {
+                    'trigger_feature': None,
+                    'unstable_feature': None,
+                    'original_tau': base_tau,
+                    'min_tau': base_tau,
+                    'max_tau_drop': 0.0,
+                    'feature_tau_drops': {},
+                }
 
-                    perturbed_shap = perturbed_interpreter.explain_shap(perturbed_idx)
+            # 将所有扰动样本拼接成一个DataFrame，一次性计算
+            all_perturbed = pd.concat(perturbed_samples, ignore_index=True)
 
-                    if 'error' in perturbed_shap or 'top_features' not in perturbed_shap:
-                        continue
+            # 使用已有的 local_interpreter 实例，避免重复创建
+            # 注意：需要用 all_perturbed 创建一个临时解释器来计算这些样本的SHAP
+            # 但是为了避免重复创建explainer，我们可以直接复用模型，重新计算
+            try:
+                import shap
+                if self.local_interpreter._shap_explainer is not None:
+                    # 复用已有explainer，直接计算
+                    shap_values = self.local_interpreter._shap_explainer.shap_values(all_perturbed)
 
-                    perturbed_rank = perturbed_shap['top_features']
+                    # 处理不同的SHAP返回格式
+                    if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+                        n_classes = shap_values.shape[2]
+                        if n_classes > 1:
+                            shap_values = shap_values[:, :, 1]
+                        else:
+                            shap_values = shap_values[:, :, 0]
+                    elif isinstance(shap_values, list):
+                        shap_values = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+
+                    shap_values = np.asarray(shap_values)
+                    if shap_values.ndim == 1:
+                        shap_values = shap_values.reshape(1, -1)
+                else:
+                    # SHAP不可用，直接返回空结果
+                    return {
+                        'trigger_feature': None,
+                        'unstable_feature': None,
+                        'original_tau': base_tau,
+                        'min_tau': base_tau,
+                        'max_tau_drop': 0.0,
+                        'feature_tau_drops': {},
+                    }
+            except Exception:
+                return {
+                    'trigger_feature': None,
+                    'unstable_feature': None,
+                    'original_tau': base_tau,
+                    'min_tau': base_tau,
+                    'max_tau_drop': 0.0,
+                    'feature_tau_drops': {},
+                }
+
+            tau_drops = []
+            feat_drops_dict = {}
+
+            for i, feat in enumerate(self.feature_names):
+                if i >= len(shap_values):
+                    continue
+
+                try:
+                    # 计算扰动后的特征重要性排序
+                    abs_shap = np.abs(shap_values[i])
+                    sorted_indices = np.argsort(-abs_shap)
+                    perturbed_rank = [self.feature_names[j] for j in sorted_indices]
+
                     tau = top3_kendall(original_rank, perturbed_rank)
                     tau_drop = base_tau - tau
 
@@ -770,6 +832,7 @@ class AdversarialExplainer:
                         'tau_after_perturb': float(tau),
                         'tau_drop': float(tau_drop),
                     })
+                    feat_drops_dict[feat] = float(tau_drop)
                 except Exception:
                     continue
 
@@ -786,7 +849,6 @@ class AdversarialExplainer:
             tau_drops.sort(key=lambda x: x['tau_drop'], reverse=True)
             max_drop = tau_drops[0]
             min_tau = min(d['tau_after_perturb'] for d in tau_drops)
-            feat_drops_dict = {d['feature']: d['tau_drop'] for d in tau_drops}
 
             return {
                 'trigger_feature': max_drop['feature'],
@@ -902,7 +964,7 @@ class AdversarialExplainer:
         }
 
     def batch_detect(self, sample_indices: Optional[List[int]] = None, n_samples: int = 10,
-                     enable_attribution_path: bool = True) -> Dict:
+                     enable_attribution_path: bool = True, attribution_only_sensitive: bool = True) -> Dict:
         if sample_indices is None:
             if len(self.X) <= n_samples:
                 sample_indices = list(range(len(self.X)))
@@ -931,6 +993,9 @@ class AdversarialExplainer:
         len_X = len(self.X)
 
         results = []
+        sensitive_indices = []
+
+        # 第一轮：先检测所有样本的敏感性
         for i, idx in enumerate(sample_indices):
             perturbed_idx_in_combined = len_X + i
 
@@ -951,20 +1016,59 @@ class AdversarialExplainer:
 
                 perturbed_sample = perturbed_samples_list[i]
 
-                attribution_path = None
-                if enable_attribution_path:
-                    attribution_path = self.trace_attribution_path(idx, original_shap)
-
+                # 先不传 attribution_path，标记一下哪些是敏感的
                 result = self._compute_sensitivity_result(
                     idx,
                     original_shap, original_lime, original_ice,
                     perturbed_shap, perturbed_lime, perturbed_ice,
                     perturbed_sample,
-                    attribution_path=attribution_path,
+                    attribution_path=None,
                 )
                 results.append(result)
+
+                if result.get('is_sensitive', False):
+                    sensitive_indices.append((i, idx, original_shap))
+
             except Exception:
                 continue
+
+        # 第二轮：只对敏感样本做归因路径追踪（如果启用）
+        if enable_attribution_path and sensitive_indices and attribution_only_sensitive:
+            for i, idx, original_shap in sensitive_indices:
+                try:
+                    attribution_path = self.trace_attribution_path(idx, original_shap)
+                    # 更新对应结果中的 trigger_feature
+                    for r in results:
+                        if r.get('sample_idx') == idx:
+                            if 'error' not in attribution_path:
+                                r['trigger_feature'] = attribution_path.get('trigger_feature')
+                                r['max_tau_drop'] = attribution_path.get('max_tau_drop')
+                            break
+                except Exception:
+                    continue
+        elif enable_attribution_path and not attribution_only_sensitive:
+            # 对所有样本做归因（原来的行为，保留兼容）
+            for i, idx in enumerate(sample_indices):
+                # 找到对应的 original_shap
+                original_shap = None
+                for r in results:
+                    if r.get('sample_idx') == idx:
+                        original_shap = r.get('_original_shap')
+                        break
+
+                if original_shap is None:
+                    continue
+
+                try:
+                    attribution_path = self.trace_attribution_path(idx, original_shap)
+                    for r in results:
+                        if r.get('sample_idx') == idx:
+                            if 'error' not in attribution_path:
+                                r['trigger_feature'] = attribution_path.get('trigger_feature')
+                                r['max_tau_drop'] = attribution_path.get('max_tau_drop')
+                            break
+                except Exception:
+                    continue
 
         n_sensitive = sum(1 for r in results if r.get('is_sensitive', False))
         pass_rate = float(1 - n_sensitive / len(results)) if results else 0.0
@@ -1580,84 +1684,113 @@ class InterpretabilityReportExporter:
         if compare_results:
             html_parts.append('<h2>🔄 样本对比模式</h2>')
             for compare_label, compare_res in compare_results:
-                s1 = compare_res['sample1']
-                s2 = compare_res['sample2']
-                diff = compare_res['decision_difference']
+                try:
+                    s1 = compare_res.get('sample1', {})
+                    s2 = compare_res.get('sample2', {})
+                    diff = compare_res.get('decision_difference')
 
-                html_parts.append(f'<h3>{compare_label}: 样本 #{s1["idx"]} vs 样本 #{s2["idx"]}</h3>')
+                    idx1 = s1.get('idx', '?')
+                    idx2 = s2.get('idx', '?')
 
-                html_parts.append(f'''
+                    html_parts.append(f'<h3>{compare_label}: 样本 #{idx1} vs 样本 #{idx2}</h3>')
+
+                    pred1 = s1.get('prediction', 0)
+                    pred2 = s2.get('prediction', 0)
+                    pred_diff = abs(pred1 - pred2)
+                    n_opposite = diff.get('n_opposite_features', 0) if diff else 0
+
+                    html_parts.append(f'''
 <div class="metric-grid">
     <div class="metric-box">
-        <div class="metric-label">样本 #{s1["idx"]} 预测值</div>
-        <div class="metric-value">{diff["prediction_sample1"]:.4f}</div>
+        <div class="metric-label">样本 #{idx1} 预测值</div>
+        <div class="metric-value">{pred1:.4f}</div>
     </div>
     <div class="metric-box">
-        <div class="metric-label">样本 #{s2["idx"]} 预测值</div>
-        <div class="metric-value">{diff["prediction_sample2"]:.4f}</div>
+        <div class="metric-label">样本 #{idx2} 预测值</div>
+        <div class="metric-value">{pred2:.4f}</div>
     </div>
     <div class="metric-box">
         <div class="metric-label">预测值差异</div>
-        <div class="metric-value">{diff["prediction_diff"]:.4f}</div>
+        <div class="metric-value">{pred_diff:.4f}</div>
     </div>
     <div class="metric-box">
         <div class="metric-label">贡献方向相反特征数</div>
-        <div class="metric-value">{diff["n_opposite_features"]}</div>
+        <div class="metric-value">{n_opposite}</div>
     </div>
 </div>
 ''')
 
-                html_parts.append('<h4>📊 SHAP瀑布图对比</h4>')
-                for sample_key, sample_data in [('s1', s1), ('s2', s2)]:
-                    shap_res = sample_data['shap']
-                    if 'feature_contributions' in shap_res:
-                        contribs = shap_res['feature_contributions'][:10]
-                        shap_waterfall = go.Figure()
-                        cum_val = shap_res.get('base_value', 0)
-                        shap_waterfall.add_trace(go.Waterfall(
-                            orientation='v',
-                            measure=['absolute'] + ['relative'] * len(contribs) + ['total'],
-                            x=['E[f(x)]'] + [f"{c['feature']}={c['value']:.2f}" for c in contribs] + ['f(x)'],
-                            y=[cum_val] + [c['shap_value'] for c in contribs] + [sum([cum_val] + [c['shap_value'] for c in contribs])],
-                            connector={'line': {'color': 'rgb(100,100,100)'}},
-                        ))
-                        shap_waterfall.update_layout(
-                            title=f'样本 #{sample_data["idx"]} SHAP瀑布图',
-                            height=400,
-                        )
-                        html_parts.append(f'<div class="plot-container" style="display: inline-block; width: 48%; margin: 1%;">{self._generate_plotly_figure(shap_waterfall)}</div>')
+                    # SHAP瀑布图对比
+                    html_parts.append('<h4>📊 SHAP瀑布图对比</h4>')
+                    shap_available = False
+                    for sample_key, sample_data in [('s1', s1), ('s2', s2)]:
+                        shap_res = sample_data.get('shap', {})
+                        if 'feature_contributions' in shap_res:
+                            shap_available = True
+                            contribs = shap_res['feature_contributions'][:10]
+                            shap_waterfall = go.Figure()
+                            cum_val = shap_res.get('base_value', 0)
+                            shap_waterfall.add_trace(go.Waterfall(
+                                orientation='v',
+                                measure=['absolute'] + ['relative'] * len(contribs) + ['total'],
+                                x=['E[f(x)]'] + [f"{c['feature']}={c['value']:.2f}" for c in contribs] + ['f(x)'],
+                                y=[cum_val] + [c['shap_value'] for c in contribs] + [sum([cum_val] + [c['shap_value'] for c in contribs])],
+                                connector={'line': {'color': 'rgb(100,100,100)'}},
+                            ))
+                            shap_waterfall.update_layout(
+                                title=f'样本 #{sample_data.get("idx", "?")} SHAP瀑布图',
+                                height=400,
+                            )
+                            html_parts.append(f'<div class="plot-container" style="display: inline-block; width: 48%; margin: 1%;">{self._generate_plotly_figure(shap_waterfall)}</div>')
+                    if not shap_available:
+                        html_parts.append('<div class="suggestion-box"><strong>💡 提示：</strong>SHAP解释器不可用，无法展示SHAP瀑布图。</div>')
 
-                html_parts.append('<h4>📊 LIME特征权重对比</h4>')
-                for sample_key, sample_data in [('s1', s1), ('s2', s2)]:
-                    lime_res = sample_data['lime']
-                    if 'feature_weights' in lime_res:
-                        weights = lime_res['feature_weights'][:10]
-                        lime_fig = go.Figure()
-                        lime_fig.add_trace(go.Bar(
-                            x=[w['weight'] for w in reversed(weights)],
-                            y=[w['feature'] for w in reversed(weights)],
-                            orientation='h',
-                            marker_color=['#e74c3c' if w['weight'] < 0 else '#27ae60' for w in reversed(weights)],
-                        ))
-                        lime_fig.update_layout(
-                            title=f'样本 #{sample_data["idx"]} LIME特征权重',
-                            xaxis_title='特征权重',
-                            height=400,
-                        )
-                        html_parts.append(f'<div class="plot-container" style="display: inline-block; width: 48%; margin: 1%;">{self._generate_plotly_figure(lime_fig)}</div>')
+                    # LIME特征权重对比
+                    html_parts.append('<h4>📊 LIME特征权重对比</h4>')
+                    lime_available = False
+                    for sample_key, sample_data in [('s1', s1), ('s2', s2)]:
+                        lime_res = sample_data.get('lime', {})
+                        if 'feature_weights' in lime_res:
+                            lime_available = True
+                            weights = lime_res['feature_weights'][:10]
+                            lime_fig = go.Figure()
+                            lime_fig.add_trace(go.Bar(
+                                x=[w['weight'] for w in reversed(weights)],
+                                y=[w['feature'] for w in reversed(weights)],
+                                orientation='h',
+                                marker_color=['#e74c3c' if w['weight'] < 0 else '#27ae60' for w in reversed(weights)],
+                            ))
+                            lime_fig.update_layout(
+                                title=f'样本 #{sample_data.get("idx", "?")} LIME特征权重',
+                                xaxis_title='特征权重',
+                                height=400,
+                            )
+                            html_parts.append(f'<div class="plot-container" style="display: inline-block; width: 48%; margin: 1%;">{self._generate_plotly_figure(lime_fig)}</div>')
+                    if not lime_available:
+                        html_parts.append('<div class="suggestion-box"><strong>💡 提示：</strong>LIME解释器不可用，无法展示LIME特征权重。</div>')
 
-                if diff.get('opposite_features'):
-                    html_parts.append('<h4>⚡ 决策差异分析 - 贡献方向相反的特征</h4>')
-                    html_parts.append('<table><tr><th>特征</th><th>样本1 SHAP</th><th>样本2 SHAP</th><th>差异绝对值</th><th>方向变化</th></tr>')
-                    for feat in diff['opposite_features'][:10]:
-                        html_parts.append(
-                            f"<tr><td>{feat['feature']}</td>"
-                            f"<td style='color: {'#27ae60' if feat['sample1_shap'] > 0 else '#e74c3c'};'>{feat['sample1_shap']:.4f}</td>"
-                            f"<td style='color: {'#27ae60' if feat['sample2_shap'] > 0 else '#e74c3c'};'>{feat['sample2_shap']:.4f}</td>"
-                            f"<td><strong>{feat['diff_abs']:.4f}</strong></td>"
-                            f"<td>{feat['direction']}</td></tr>"
-                        )
-                    html_parts.append('</table>')
+                    # 决策差异分析
+                    if diff and diff.get('opposite_features'):
+                        html_parts.append('<h4>⚡ 决策差异分析 - 贡献方向相反的特征</h4>')
+                        html_parts.append('<table><tr><th>特征</th><th>样本1 SHAP</th><th>样本2 SHAP</th><th>差异绝对值</th><th>方向变化</th></tr>')
+                        for feat in diff['opposite_features'][:10]:
+                            color1 = '#27ae60' if feat.get('sample1_shap', 0) > 0 else '#e74c3c'
+                            color2 = '#27ae60' if feat.get('sample2_shap', 0) > 0 else '#e74c3c'
+                            html_parts.append(
+                                f"<tr><td>{feat.get('feature', '?')}</td>"
+                                f"<td style='color: {color1};'>{feat.get('sample1_shap', 0):.4f}</td>"
+                                f"<td style='color: {color2};'>{feat.get('sample2_shap', 0):.4f}</td>"
+                                f"<td><strong>{feat.get('diff_abs', 0):.4f}</strong></td>"
+                                f"<td>{feat.get('direction', '-')}</td></tr>"
+                            )
+                        html_parts.append('</table>')
+                    else:
+                        if not diff:
+                            html_parts.append('<div class="suggestion-box"><strong>💡 提示：</strong>SHAP解释器不可用，无法进行决策差异分析。</div>')
+                        elif n_opposite == 0:
+                            html_parts.append('<div class="suggestion-box"><strong>📌 说明：</strong>两个样本没有发现贡献方向相反的特征。</div>')
+                except Exception as e:
+                    html_parts.append(f'<div class="suggestion-box"><strong>⚠️ 样本对比渲染失败：</strong>{str(e)}</div>')
 
         html_parts.append('<h2>🛡️ 对抗性解释检测</h2>')
         adv = adversarial_result

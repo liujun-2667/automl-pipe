@@ -1187,100 +1187,116 @@ def step_interpretability():
                 st.dataframe(sample_row2.T, use_container_width=True)
 
             if st.button("🔬 对比分析两个样本", key="run_compare"):
-                with st.spinner("正在计算样本对比解释..."):
-                    local = LocalInterpreter(
-                        best_model, X, pipeline.task_type, feature_names, pipeline.random_state
-                    )
-                    compare_res = local.explain_compare(sample_idx1, sample_idx2)
+                if sample_idx1 == sample_idx2:
+                    st.warning("⚠️ 两个样本索引相同，请选择不同的样本进行对比。")
+                else:
+                    with st.spinner("正在计算样本对比解释..."):
+                        local = LocalInterpreter(
+                            best_model, X, pipeline.task_type, feature_names, pipeline.random_state
+                        )
+                        compare_res = local.explain_compare(sample_idx1, sample_idx2)
 
-                    if 'error' in compare_res:
-                        st.error(f"对比分析出错: {compare_res['error']}")
-                    else:
-                        s1 = compare_res['sample1']
-                        s2 = compare_res['sample2']
-                        diff = compare_res['decision_difference']
+                        if 'error' in compare_res:
+                            st.error(f"对比分析出错: {compare_res['error']}")
+                        else:
+                            s1 = compare_res['sample1']
+                            s2 = compare_res['sample2']
+                            diff = compare_res.get('decision_difference')
 
-                        st.markdown("---")
-                        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-                        col_m1.metric(f"样本 #{s1['idx']} 预测值", f"{diff['prediction_sample1']:.4f}")
-                        col_m2.metric(f"样本 #{s2['idx']} 预测值", f"{diff['prediction_sample2']:.4f}")
-                        col_m3.metric("预测值差异", f"{diff['prediction_diff']:.4f}")
-                        col_m4.metric("贡献方向相反特征数", diff['n_opposite_features'])
+                            st.markdown("---")
+                            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 
-                        st.info(diff['summary'])
+                            pred1 = s1.get('prediction', 0)
+                            pred2 = s2.get('prediction', 0)
+                            pred_diff = abs(pred1 - pred2)
+                            n_opposite = diff.get('n_opposite_features', 0) if diff else 0
 
-                        st.markdown("---")
-                        st.subheader("📊 SHAP瀑布图对比")
-                        col_w1, col_w2 = st.columns(2)
+                            col_m1.metric(f"样本 #{s1['idx']} 预测值", f"{pred1:.4f}")
+                            col_m2.metric(f"样本 #{s2['idx']} 预测值", f"{pred2:.4f}")
+                            col_m3.metric("预测值差异", f"{pred_diff:.4f}")
+                            col_m4.metric("贡献方向相反特征数", n_opposite)
 
-                        with col_w1:
-                            shap1 = s1['shap']
-                            if 'feature_contributions' in shap1:
-                                fig, ax = plt.subplots(figsize=(8, 8))
-                                contribs1 = shap1['feature_contributions'][:10]
-                                feats1 = [f"{c['feature']}={c['value']:.2f}" for c in contribs1]
-                                vals1 = [c['shap_value'] for c in contribs1]
-                                base_val1 = shap1.get('base_value', 0)
+                            if diff:
+                                st.info(diff.get('summary', ''))
+                            else:
+                                st.info("💡 SHAP解释器不可用，无法进行详细的决策差异分析，但仍可查看基础对比结果。")
 
-                                cum_vals1 = [base_val1]
-                                for v in vals1:
-                                    cum_vals1.append(cum_vals1[-1] + v)
+                            st.markdown("---")
+                            st.subheader("📊 SHAP瀑布图对比")
+                            col_w1, col_w2 = st.columns(2)
 
-                                colors1 = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals1]
-                                y_pos1 = np.arange(len(contribs1))
+                            with col_w1:
+                                shap1 = s1.get('shap', {})
+                                if 'feature_contributions' in shap1:
+                                    fig, ax = plt.subplots(figsize=(8, 8))
+                                    contribs1 = shap1['feature_contributions'][:10]
+                                    feats1 = [f"{c['feature']}={c['value']:.2f}" for c in contribs1]
+                                    vals1 = [c['shap_value'] for c in contribs1]
+                                    base_val1 = shap1.get('base_value', 0)
 
-                                for i, (feat, val, cum, color) in enumerate(zip(feats1, vals1, cum_vals1[:-1], colors1)):
-                                    ax.barh(i, val, left=cum, color=color, alpha=0.8, height=0.6)
+                                    cum_vals1 = [base_val1]
+                                    for v in vals1:
+                                        cum_vals1.append(cum_vals1[-1] + v)
 
-                                ax.set_yticks(y_pos1)
-                                ax.set_yticklabels(feats1)
-                                ax.axvline(x=base_val1, color='gray', linestyle='--', alpha=0.5, label=f'Base: {base_val1:.3f}')
-                                ax.axvline(x=cum_vals1[-1], color='blue', linestyle='-', alpha=0.7, label=f'Pred: {cum_vals1[-1]:.3f}')
-                                ax.set_xlabel('SHAP值')
-                                ax.set_title(f'样本 #{s1["idx"]} SHAP瀑布图')
-                                ax.legend()
-                                ax.invert_yaxis()
-                                plt.tight_layout()
-                                st.pyplot(fig)
-                                plt.close(fig)
+                                    colors1 = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals1]
+                                    y_pos1 = np.arange(len(contribs1))
 
-                        with col_w2:
-                            shap2 = s2['shap']
-                            if 'feature_contributions' in shap2:
-                                fig, ax = plt.subplots(figsize=(8, 8))
-                                contribs2 = shap2['feature_contributions'][:10]
-                                feats2 = [f"{c['feature']}={c['value']:.2f}" for c in contribs2]
-                                vals2 = [c['shap_value'] for c in contribs2]
-                                base_val2 = shap2.get('base_value', 0)
+                                    for i, (feat, val, cum, color) in enumerate(zip(feats1, vals1, cum_vals1[:-1], colors1)):
+                                        ax.barh(i, val, left=cum, color=color, alpha=0.8, height=0.6)
 
-                                cum_vals2 = [base_val2]
-                                for v in vals2:
-                                    cum_vals2.append(cum_vals2[-1] + v)
+                                    ax.set_yticks(y_pos1)
+                                    ax.set_yticklabels(feats1)
+                                    ax.axvline(x=base_val1, color='gray', linestyle='--', alpha=0.5, label=f'Base: {base_val1:.3f}')
+                                    ax.axvline(x=cum_vals1[-1], color='blue', linestyle='-', alpha=0.7, label=f'Pred: {cum_vals1[-1]:.3f}')
+                                    ax.set_xlabel('SHAP值')
+                                    ax.set_title(f'样本 #{s1["idx"]} SHAP瀑布图')
+                                    ax.legend()
+                                    ax.invert_yaxis()
+                                    plt.tight_layout()
+                                    st.pyplot(fig)
+                                    plt.close(fig)
+                                else:
+                                    st.info("💡 样本1 SHAP解释不可用")
 
-                                colors2 = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals2]
-                                y_pos2 = np.arange(len(contribs2))
+                            with col_w2:
+                                shap2 = s2.get('shap', {})
+                                if 'feature_contributions' in shap2:
+                                    fig, ax = plt.subplots(figsize=(8, 8))
+                                    contribs2 = shap2['feature_contributions'][:10]
+                                    feats2 = [f"{c['feature']}={c['value']:.2f}" for c in contribs2]
+                                    vals2 = [c['shap_value'] for c in contribs2]
+                                    base_val2 = shap2.get('base_value', 0)
 
-                                for i, (feat, val, cum, color) in enumerate(zip(feats2, vals2, cum_vals2[:-1], colors2)):
-                                    ax.barh(i, val, left=cum, color=color, alpha=0.8, height=0.6)
+                                    cum_vals2 = [base_val2]
+                                    for v in vals2:
+                                        cum_vals2.append(cum_vals2[-1] + v)
 
-                                ax.set_yticks(y_pos2)
-                                ax.set_yticklabels(feats2)
-                                ax.axvline(x=base_val2, color='gray', linestyle='--', alpha=0.5, label=f'Base: {base_val2:.3f}')
-                                ax.axvline(x=cum_vals2[-1], color='blue', linestyle='-', alpha=0.7, label=f'Pred: {cum_vals2[-1]:.3f}')
-                                ax.set_xlabel('SHAP值')
-                                ax.set_title(f'样本 #{s2["idx"]} SHAP瀑布图')
-                                ax.legend()
-                                ax.invert_yaxis()
-                                plt.tight_layout()
-                                st.pyplot(fig)
-                                plt.close(fig)
+                                    colors2 = ['#27ae60' if v >= 0 else '#e74c3c' for v in vals2]
+                                    y_pos2 = np.arange(len(contribs2))
+
+                                    for i, (feat, val, cum, color) in enumerate(zip(feats2, vals2, cum_vals2[:-1], colors2)):
+                                        ax.barh(i, val, left=cum, color=color, alpha=0.8, height=0.6)
+
+                                    ax.set_yticks(y_pos2)
+                                    ax.set_yticklabels(feats2)
+                                    ax.axvline(x=base_val2, color='gray', linestyle='--', alpha=0.5, label=f'Base: {base_val2:.3f}')
+                                    ax.axvline(x=cum_vals2[-1], color='blue', linestyle='-', alpha=0.7, label=f'Pred: {cum_vals2[-1]:.3f}')
+                                    ax.set_xlabel('SHAP值')
+                                    ax.set_title(f'样本 #{s2["idx"]} SHAP瀑布图')
+                                    ax.legend()
+                                    ax.invert_yaxis()
+                                    plt.tight_layout()
+                                    st.pyplot(fig)
+                                    plt.close(fig)
+                                else:
+                                    st.info("💡 样本2 SHAP解释不可用")
 
                         st.markdown("---")
                         st.subheader("📊 LIME特征权重对比")
                         col_l1, col_l2 = st.columns(2)
 
                         with col_l1:
-                            lime1 = s1['lime']
+                            lime1 = s1.get('lime', {})
                             if 'feature_weights' in lime1:
                                 fig, ax = plt.subplots(figsize=(8, 8))
                                 weights1 = lime1['feature_weights'][:10]
@@ -1299,9 +1315,11 @@ def step_interpretability():
                                 plt.tight_layout()
                                 st.pyplot(fig)
                                 plt.close(fig)
+                            else:
+                                st.info("💡 样本1 LIME解释不可用")
 
                         with col_l2:
-                            lime2 = s2['lime']
+                            lime2 = s2.get('lime', {})
                             if 'feature_weights' in lime2:
                                 fig, ax = plt.subplots(figsize=(8, 8))
                                 weights2 = lime2['feature_weights'][:10]
@@ -1320,8 +1338,10 @@ def step_interpretability():
                                 plt.tight_layout()
                                 st.pyplot(fig)
                                 plt.close(fig)
+                            else:
+                                st.info("💡 样本2 LIME解释不可用")
 
-                        if diff.get('opposite_features'):
+                        if diff and diff.get('opposite_features'):
                             st.markdown("---")
                             st.subheader("⚡ 决策差异分析")
                             st.caption("以下特征在两个样本间的SHAP贡献方向相反（一个正贡献一个负贡献），按差异绝对值从大到小排序：")
