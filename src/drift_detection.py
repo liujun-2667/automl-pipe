@@ -10,7 +10,7 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
-from scipy.stats import ks_2samp, chi2_contingency
+from scipy.stats import ks_2samp, chi2_contingency, gaussian_kde
 import warnings
 import json
 import os
@@ -608,6 +608,150 @@ class DriftDetector:
 
         return result
 
+    def get_feature_drilldown(self, feature: str, new_data: pd.DataFrame) -> Dict:
+        """漂移根因下钻：返回单个特征在参考集与新数据集的详细对比
+
+        Args:
+            feature: 特征名
+            new_data: 待检测的新数据集
+
+        Returns:
+            包含描述统计、分位数对比、KDE/瀑布图数据的字典
+        """
+        if feature not in self.column_types:
+            return {'error': f'特征 {feature} 不在列类型配置中'}
+
+        if feature not in self.reference_data.columns:
+            return {'error': f'参考数据中无特征 {feature}'}
+
+        if feature not in new_data.columns:
+            return {'error': f'新数据中无特征 {feature}'}
+
+        col_type = self.column_types[feature]
+        ref_series = self.reference_data[feature]
+        new_series = new_data[feature]
+
+        result = {'feature': feature, 'type': col_type}
+
+        if col_type == 'numeric':
+            result['stats'] = self._numeric_describe(ref_series, new_series)
+            result['quantiles'] = self._quantile_comparison(ref_series, new_series)
+            result['kde'] = self._kde_overlay_data(ref_series, new_series)
+        elif col_type == 'categorical':
+            result['stats'] = self._categorical_describe(ref_series, new_series)
+            result['waterfall'] = self._category_waterfall(ref_series, new_series)
+
+        return result
+
+    @staticmethod
+    def _numeric_describe(ref_series: pd.Series, new_series: pd.Series) -> Dict:
+        """数值型特征描述统计对比"""
+        def describe(s: pd.Series) -> Dict:
+            clean = pd.to_numeric(s, errors='coerce').dropna()
+            total = len(s)
+            if len(clean) == 0:
+                return {
+                    'mean': 0.0, 'median': 0.0, 'std': 0.0,
+                    'min': 0.0, 'max': 0.0,
+                    'missing_rate': 1.0 if total > 0 else 1.0,
+                    'count': 0,
+                }
+            return {
+                'mean': float(clean.mean()),
+                'median': float(clean.median()),
+                'std': float(clean.std()),
+                'min': float(clean.min()),
+                'max': float(clean.max()),
+                'missing_rate': float(s.isna().mean()) if total > 0 else 1.0,
+                'count': int(len(clean)),
+            }
+        return {'reference': describe(ref_series), 'new': describe(new_series)}
+
+    @staticmethod
+    def _quantile_comparison(ref_series: pd.Series, new_series: pd.Series) -> List[Dict]:
+        """分位数对比 (5%/25%/50%/75%/95%)"""
+        quantiles = [0.05, 0.25, 0.50, 0.75, 0.95]
+        ref_clean = pd.to_numeric(ref_series, errors='coerce').dropna()
+        new_clean = pd.to_numeric(new_series, errors='coerce').dropna()
+        rows = []
+        for q in quantiles:
+            ref_q = float(ref_clean.quantile(q)) if len(ref_clean) else 0.0
+            new_q = float(new_clean.quantile(q)) if len(new_clean) else 0.0
+            rows.append({
+                'quantile': f'{int(q * 100)}%',
+                'reference': ref_q,
+                'new': new_q,
+                'diff': float(new_q - ref_q),
+            })
+        return rows
+
+    @staticmethod
+    def _kde_overlay_data(ref_series: pd.Series, new_series: pd.Series) -> Dict:
+        """KDE密度曲线叠加数据"""
+        ref_clean = pd.to_numeric(ref_series, errors='coerce').dropna().values
+        new_clean = pd.to_numeric(new_series, errors='coerce').dropna().values
+
+        if len(ref_clean) < 2 or len(new_clean) < 2:
+            return {'available': False, 'reason': '样本数不足'}
+
+        try:
+            lo = float(min(ref_clean.min(), new_clean.min()))
+            hi = float(max(ref_clean.max(), new_clean.max()))
+            if hi <= lo:
+                return {'available': False, 'reason': '数据范围为空'}
+
+            span = hi - lo
+            grid = np.linspace(lo - span * 0.05, hi + span * 0.05, 100)
+
+            ref_kde = gaussian_kde(ref_clean)
+            new_kde = gaussian_kde(new_clean)
+
+            return {
+                'available': True,
+                'grid': grid.tolist(),
+                'ref_density': ref_kde(grid).tolist(),
+                'new_density': new_kde(grid).tolist(),
+            }
+        except Exception as e:
+            return {'available': False, 'reason': str(e)}
+
+    @staticmethod
+    def _categorical_describe(ref_series: pd.Series, new_series: pd.Series) -> Dict:
+        """分类型特征描述统计对比"""
+        def describe(s: pd.Series) -> Dict:
+            clean = s.astype(str).dropna()
+            vc = clean.value_counts()
+            return {
+                'n_unique': int(clean.nunique()),
+                'top': str(vc.index[0]) if len(vc) else '',
+                'top_freq': int(vc.iloc[0]) if len(vc) else 0,
+                'missing_rate': float(s.isna().mean()) if len(s) else 1.0,
+                'count': int(len(clean)),
+            }
+        return {'reference': describe(ref_series), 'new': describe(new_series)}
+
+    @staticmethod
+    def _category_waterfall(ref_series: pd.Series, new_series: pd.Series) -> List[Dict]:
+        """分类占比变化瀑布图数据 (参考占比 -> 新占比的增减)"""
+        ref_clean = ref_series.astype(str).dropna()
+        new_clean = new_series.astype(str).dropna()
+        ref_vc = ref_clean.value_counts(normalize=True)
+        new_vc = new_clean.value_counts(normalize=True)
+        all_cats = sorted(set(ref_vc.index) | set(new_vc.index))
+
+        rows = []
+        for cat in all_cats:
+            ref_p = float(ref_vc.get(cat, 0.0))
+            new_p = float(new_vc.get(cat, 0.0))
+            rows.append({
+                'category': cat,
+                'reference': ref_p,
+                'new': new_p,
+                'delta': float(new_p - ref_p),
+            })
+        rows.sort(key=lambda x: abs(x['delta']), reverse=True)
+        return rows
+
     def _describe_direction(self, col: str, test: Dict) -> str:
         """将方向枚举转换为可读描述"""
         direction = test.get('direction', 'none')
@@ -1001,3 +1145,262 @@ class DriftReportExporter:
                 f"</tr>"
             )
         return '\n'.join(rows)
+
+
+def compute_weighted_psi(feature_psi: Dict, feature_weights: Dict) -> Optional[float]:
+    """计算特征重要性加权PSI
+
+    每个特征的PSI值乘以其归一化后的重要性权重再求和。
+    若无有效权重（如尚未完成特征选择），返回 None。
+
+    Args:
+        feature_psi: 各特征PSI详情 {feature: {'psi_value': float}}
+        feature_weights: 特征重要性权重 {feature: weight}
+
+    Returns:
+        加权PSI值；若无有效权重则返回 None
+    """
+    if not feature_weights:
+        return None
+
+    relevant = {}
+    for feat, w in feature_weights.items():
+        if feat not in feature_psi:
+            continue
+        psi_info = feature_psi[feat]
+        psi_val = psi_info.get('psi_value', 0.0) if isinstance(psi_info, dict) else psi_info
+        if not np.isfinite(psi_val):
+            continue
+        try:
+            w_f = float(w)
+        except (TypeError, ValueError):
+            continue
+        if w_f < 0 or not np.isfinite(w_f):
+            continue
+        relevant[feat] = w_f
+
+    if not relevant:
+        return None
+
+    total_w = sum(relevant.values())
+    if total_w <= 0:
+        return None
+
+    weighted = 0.0
+    for feat, w in relevant.items():
+        psi_info = feature_psi[feat]
+        psi_val = psi_info.get('psi_value', 0.0) if isinstance(psi_info, dict) else psi_info
+        weighted += float(psi_val) * (w / total_w)
+    return float(weighted)
+
+
+class SlidingWindowDriftMonitor:
+    """滑动窗口漂移监控器
+
+    维护一个时间滑动窗口，每次窗口滑动时自动执行漂移检测并记录结果。
+    窗口内数据不足窗口大小时用已有数据填充，并在结果中标注
+    "数据不足，结果仅供参考"。
+    """
+
+    def __init__(
+        self,
+        reference_data: pd.DataFrame,
+        column_types: Dict[str, str],
+        window_size: int = 1000,
+        step_size: int = 100,
+        n_bins: int = 10,
+        p_value_threshold: float = 0.05,
+    ):
+        self.reference_data = reference_data.copy()
+        self.column_types = column_types
+        self.window_size = max(1, int(window_size))
+        self.step_size = max(1, int(step_size))
+        self.n_bins = n_bins
+        self.p_value_threshold = p_value_threshold
+
+        self._buffer_parts: List[pd.DataFrame] = []
+        self._window_start = 0
+        self._total_seen = 0
+        self._detector = DriftDetector(
+            reference_data, column_types, n_bins, p_value_threshold
+        )
+
+    @property
+    def feature_columns(self) -> List[str]:
+        return self._detector._feature_columns
+
+    def add_data(self, new_data: pd.DataFrame) -> int:
+        """追加新数据到缓冲区，返回累计见到的总行数"""
+        if new_data is None or len(new_data) == 0:
+            return self._total_seen
+        self._buffer_parts.append(new_data.copy())
+        self._total_seen += len(new_data)
+        return self._total_seen
+
+    def _get_full_buffer(self) -> pd.DataFrame:
+        if not self._buffer_parts:
+            return pd.DataFrame()
+        return pd.concat(self._buffer_parts, ignore_index=True)
+
+    def get_current_window(self) -> pd.DataFrame:
+        """获取当前窗口内的数据"""
+        full = self._get_full_buffer()
+        if full.empty:
+            return pd.DataFrame()
+        end = min(self._window_start + self.window_size, len(full))
+        return full.iloc[self._window_start:end].copy()
+
+    def detect_current_window(self) -> Dict:
+        """对当前窗口执行漂移检测"""
+        window = self.get_current_window()
+        data_insufficient = len(window) < self.window_size
+
+        if window.empty:
+            return {
+                'error': '窗口内暂无数据',
+                'data_insufficient': True,
+                'window_note': '数据不足，结果仅供参考',
+            }
+
+        feature_cols = [c for c in self.feature_columns if c in window.columns]
+        window_filtered = window[feature_cols].copy()
+
+        if window_filtered.empty:
+            return {
+                'error': '窗口内无可分析特征',
+                'data_insufficient': True,
+                'window_note': '数据不足，结果仅供参考',
+            }
+
+        result = self._detector.detect(window_filtered)
+        result['data_insufficient'] = data_insufficient
+        result['window_size'] = self.window_size
+        result['actual_window_size'] = len(window)
+        result['window_start'] = self._window_start
+        result['window_end'] = self._window_start + len(window)
+        result['total_seen'] = self._total_seen
+        result['detection_mode'] = 'sliding_window'
+        if data_insufficient:
+            result['window_note'] = '数据不足，结果仅供参考'
+        return result
+
+    def slide(self) -> bool:
+        """窗口向前滑动一个步长，返回是否成功滑动"""
+        full = self._get_full_buffer()
+        next_start = self._window_start + self.step_size
+        if next_start >= len(full):
+            return False
+        self._window_start = next_start
+        return True
+
+    def can_slide(self) -> bool:
+        full = self._get_full_buffer()
+        return (self._window_start + self.step_size) < len(full)
+
+    def reset(self):
+        self._buffer_parts = []
+        self._window_start = 0
+        self._total_seen = 0
+
+    def get_status(self) -> Dict:
+        full = self._get_full_buffer()
+        return {
+            'window_size': self.window_size,
+            'step_size': self.step_size,
+            'window_start': self._window_start,
+            'buffer_size': len(full),
+            'total_seen': self._total_seen,
+            'can_slide': self.can_slide(),
+            'remaining_in_window': max(0, len(full) - self._window_start),
+        }
+
+
+class DriftTrendTracker:
+    """漂移趋势追踪器
+
+    按时间顺序存储每次检测的PSI值和漂移特征数量，并支持识别
+    连续超过警戒线的区间。
+    """
+
+    STABLE_THRESHOLD = 0.1
+    WARNING_THRESHOLD = 0.25
+
+    def __init__(self):
+        self._records: List[Dict] = []
+
+    def record(self, detection_result: Dict,
+               weighted_psi: Optional[float] = None) -> Dict:
+        """记录一次检测结果"""
+        if weighted_psi is not None and isinstance(weighted_psi, float) \
+                and np.isnan(weighted_psi):
+            weighted_psi = None
+
+        rec = {
+            'seq': len(self._records) + 1,
+            'timestamp': detection_result.get(
+                'timestamp', datetime.now().isoformat()
+            ),
+            'overall_psi': float(detection_result.get('overall_psi', 0.0)),
+            'weighted_psi': (
+                float(weighted_psi) if weighted_psi is not None else None
+            ),
+            'n_drifted': int(detection_result.get('n_drifted', 0)),
+            'n_total_features': int(detection_result.get('n_total_features', 0)),
+            'overall_alert_level': detection_result.get(
+                'overall_alert_level', 'stable'
+            ),
+            'data_insufficient': detection_result.get('data_insufficient', False),
+        }
+        self._records.append(rec)
+        return rec
+
+    def get_records(self) -> List[Dict]:
+        return list(self._records)
+
+    def clear(self):
+        self._records = []
+
+    def __len__(self):
+        return len(self._records)
+
+    def get_warning_streaks(
+        self,
+        warning_threshold: Optional[float] = None,
+        min_consecutive: int = 3,
+    ) -> List[Dict]:
+        """找出连续超过警戒线的检测区间"""
+        threshold = self.WARNING_THRESHOLD if warning_threshold is None else warning_threshold
+        streaks = []
+        start = None
+        count = 0
+
+        for i, rec in enumerate(self._records):
+            over = rec['overall_psi'] > threshold
+            if over:
+                if start is None:
+                    start = i
+                    count = 1
+                else:
+                    count += 1
+            else:
+                if start is not None and count >= min_consecutive:
+                    streaks.append(self._make_streak(start, i - 1, count))
+                start = None
+                count = 0
+
+        if start is not None and count >= min_consecutive:
+            streaks.append(self._make_streak(start, len(self._records) - 1, count))
+        return streaks
+
+    def _make_streak(self, start_idx: int, end_idx: int, length: int) -> Dict:
+        return {
+            'start_seq': self._records[start_idx]['seq'],
+            'end_seq': self._records[end_idx]['seq'],
+            'start_idx': start_idx,
+            'end_idx': end_idx,
+            'length': length,
+        }
+
+    def get_max_streak(self, warning_threshold: Optional[float] = None) -> int:
+        streaks = self.get_warning_streaks(warning_threshold, min_consecutive=1)
+        return max((s['length'] for s in streaks), default=0)

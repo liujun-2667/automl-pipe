@@ -25,6 +25,7 @@ from src.interpretability import (
 )
 from src.drift_detection import (
     DriftDetector, AlertStorage, DriftReportExporter,
+    compute_weighted_psi, SlidingWindowDriftMonitor, DriftTrendTracker,
 )
 
 st.set_page_config(
@@ -69,6 +70,28 @@ def init_session_state():
         st.session_state.drift_reference_df = None
     if 'drift_new_df' not in st.session_state:
         st.session_state.drift_new_df = None
+    if 'drift_detection_mode' not in st.session_state:
+        st.session_state.drift_detection_mode = 'once'
+    if 'drift_monitor' not in st.session_state:
+        st.session_state.drift_monitor = None
+    if 'drift_trend_tracker' not in st.session_state:
+        st.session_state.drift_trend_tracker = DriftTrendTracker()
+    if 'drift_auto_monitoring' not in st.session_state:
+        st.session_state.drift_auto_monitoring = False
+    if 'drift_auto_interval' not in st.session_state:
+        st.session_state.drift_auto_interval = 30
+    if 'drift_window_result' not in st.session_state:
+        st.session_state.drift_window_result = None
+    if 'drift_weighted_psi' not in st.session_state:
+        st.session_state.drift_weighted_psi = None
+    if 'drift_feature_weights' not in st.session_state:
+        st.session_state.drift_feature_weights = None
+    if 'drift_last_detector' not in st.session_state:
+        st.session_state.drift_last_detector = None
+    if 'drift_last_ref_df' not in st.session_state:
+        st.session_state.drift_last_ref_df = None
+    if 'drift_last_new_df' not in st.session_state:
+        st.session_state.drift_last_new_df = None
     if 'is_running' not in st.session_state:
         st.session_state.is_running = False
 
@@ -1763,6 +1786,21 @@ def step_drift_detection():
 
     pipeline = st.session_state.pipeline
 
+    mode_label = st.radio(
+        "检测模式",
+        options=["一次性全量检测", "滑动窗口持续监控"],
+        format_func=lambda x: x,
+        horizontal=True,
+        key="drift_mode_radio",
+        help="全量检测对比两份数据；滑动窗口模式按窗口/步长持续监控新数据流",
+    )
+    st.session_state.drift_detection_mode = (
+        'once' if mode_label == "一次性全量检测" else 'sliding'
+    )
+
+    if st.session_state.drift_feature_weights is None:
+        st.session_state.drift_feature_weights = _get_drift_feature_weights(pipeline)
+
     left_col, right_col = st.columns([1, 3])
 
     with left_col:
@@ -1808,7 +1846,10 @@ def step_drift_detection():
 
         st.markdown("---")
         st.markdown("**待检测数据集 (New)")
-        st.caption("部署后新进来的数据，需要检测是否发生分布偏移的数据")
+        if st.session_state.drift_detection_mode == 'sliding':
+            st.caption("滑动窗口模式：该数据作为持续流入的数据流，按步长切片进窗口")
+        else:
+            st.caption("部署后新进来的数据，需要检测是否发生分布偏移的数据")
         new_option = st.radio(
             "选择待检测数据来源",
             options=["使用Pipeline内部测试集", "上传CSV文件"],
@@ -1849,53 +1890,55 @@ def step_drift_detection():
             key="drift_storage_path",
         )
 
-        col_run_l, col_run_r = st.columns([1, 1])
-        with col_run_r:
-            run_drift_btn = st.button("🔍 开始漂移检测", type="primary", key="run_drift_button")
+        if st.session_state.drift_detection_mode == 'sliding':
+            run_drift_btn = _render_sliding_window_controls(
+                pipeline, ref_df, new_df, ref_name, new_name, storage_path
+            )
+        else:
+            col_run_l, col_run_r = st.columns([1, 1])
+            with col_run_r:
+                run_drift_btn = st.button("🔍 开始漂移检测", type="primary", key="run_drift_button")
 
     with right_col:
         alert_banner_displayed = False
+        active_result = (
+            st.session_state.drift_window_result
+            if st.session_state.drift_detection_mode == 'sliding'
+            else st.session_state.drift_detection_result
+        )
 
-        if st.session_state.drift_detection_result:
-            result = st.session_state.drift_detection_result
+        if active_result:
+            result = active_result
             if 'error' in result:
                 st.error(result['error'])
             else:
                 alert_banner_displayed = True
                 _render_drift_alert_banner(result)
+                if result.get('data_insufficient'):
+                    st.warning(f"⏳ {result.get('window_note', '数据不足，结果仅供参考')}")
 
-        if (run_drift_btn or st.session_state.drift_detection_result):
-            if run_drift_btn:
-                if ref_df is None or new_df is None:
-                    st.error("❌ 请先选择参考数据集和待检测数据集!")
+        if (run_drift_btn or active_result):
+            if run_drift_btn and st.session_state.drift_detection_mode == 'once':
+                prep = _prepare_drift_dataframes(pipeline, ref_df, new_df)
+                if prep is None:
                     return
+                feature_col_types, ref_filtered, new_filtered = prep
 
                 with st.spinner("正在进行数据漂移检测..."):
                     try:
-                        feature_col_types = {
-                            col: col_type
-                            for col, col_type in pipeline.column_types.items()
-                            if col != pipeline.target_column
-                        }
-
-                        ref_feature_cols = [
-                            c for c in ref_df.columns
-                            if c in feature_col_types and feature_col_types[c] in ('numeric', 'categorical')
-                        ]
-
-                        ref_filtered = ref_df[ref_feature_cols].copy()
-                        new_feature_cols = [c for c in ref_feature_cols if c in new_df.columns]
-                        new_filtered = new_df[new_feature_cols].copy()
-
-                        if ref_filtered.empty:
-                            st.error("❌ 参考数据集中没有可分析的数值/分类特征，请检查列类型配置。")
-                            return
-
                         detector = DriftDetector(
                             reference_data=ref_filtered,
                             column_types=feature_col_types,
                         )
                         result = detector.detect(new_filtered)
+
+                        weighted_psi = compute_weighted_psi(
+                            result['feature_psi'],
+                            st.session_state.drift_feature_weights,
+                        )
+
+                        st.session_state.drift_trend_tracker.record(result, weighted_psi)
+                        st.session_state.drift_weighted_psi = weighted_psi
 
                         try:
                             storage = AlertStorage(storage_path=storage_path)
@@ -1907,6 +1950,9 @@ def step_drift_detection():
                             pass
 
                         st.session_state.drift_detection_result = result
+                        st.session_state.drift_last_detector = detector
+                        st.session_state.drift_last_ref_df = ref_filtered
+                        st.session_state.drift_last_new_df = new_filtered
 
                         if not alert_banner_displayed:
                             _render_drift_alert_banner(result)
@@ -1917,22 +1963,48 @@ def step_drift_detection():
                         st.code(traceback.format_exc())
                         return
 
-            result = st.session_state.drift_detection_result
+            result = active_result
 
-            if not alert_banner_displayed and 'error' not in result:
+            if result is None:
+                return
+
+            if 'error' in result:
+                return
+
+            if not alert_banner_displayed:
                 _render_drift_alert_banner(result)
+                if result.get('data_insufficient'):
+                    st.warning(f"⏳ {result.get('window_note', '数据不足，结果仅供参考')}")
 
-            _render_drift_metrics_overview(result)
+            _render_drift_metrics_overview(result, st.session_state.drift_weighted_psi)
 
             st.markdown("---")
 
-            tab_heatmap, tab_distributions = st.tabs(["🔥 单特征漂移热力图", "📈 分布对比图"])
+            tab_heatmap, tab_distributions, tab_trend, tab_weighted = st.tabs([
+                "🔥 单特征漂移热力图",
+                "📈 分布对比图",
+                "📊 漂移趋势追踪",
+                "⚖️ 加权PSI对比",
+            ])
 
             with tab_heatmap:
                 _render_drift_heatmap(result)
+                _render_drift_drilldown_panel()
 
             with tab_distributions:
                 _render_drift_distribution_plots(result, pipeline)
+
+            with tab_trend:
+                _render_drift_trend_chart(
+                    st.session_state.drift_trend_tracker,
+                    result.get('n_total_features', 0),
+                )
+
+            with tab_weighted:
+                _render_drift_weighted_psi(
+                    result, st.session_state.drift_weighted_psi,
+                    st.session_state.drift_feature_weights,
+                )
 
             st.markdown("---")
             _render_drift_history(storage_path)
@@ -1946,6 +2018,484 @@ def step_drift_detection():
                 if st.button("➡️ 下一步：导出Pipeline", type="primary", key="drift_next_btn"):
                     st.session_state.current_step = 7
                     st.rerun()
+
+    if (st.session_state.drift_detection_mode == 'sliding'
+            and st.session_state.drift_auto_monitoring
+            and st.session_state.drift_monitor is not None):
+        if st.session_state.drift_monitor.can_slide():
+            time.sleep(int(st.session_state.drift_auto_interval))
+            st.rerun()
+        else:
+            st.session_state.drift_auto_monitoring = False
+
+
+def _get_drift_feature_weights(pipeline):
+    """从Pipeline特征选择模块提取归一化的特征重要性权重"""
+    analyzer = getattr(pipeline, 'feature_analyzer', None)
+    if analyzer is None or getattr(analyzer, 'feature_names_', None) is None:
+        return None
+    try:
+        importances = analyzer.get_all_importances()
+    except Exception:
+        return None
+    if importances is None or len(importances) == 0:
+        return None
+    avail = [c for c in ['random_forest', 'permutation', 'l1_regularization']
+             if c in importances.columns]
+    if not avail:
+        return None
+    weights = importances[avail].mean(axis=1).fillna(0)
+    total = weights.sum()
+    if total > 0:
+        weights = weights / total
+    return weights.to_dict()
+
+
+def _prepare_drift_dataframes(pipeline, ref_df, new_df):
+    """准备漂移检测所需的特征列类型与过滤后的数据框"""
+    if ref_df is None or new_df is None:
+        st.error("❌ 请先选择参考数据集和待检测数据集!")
+        return None
+
+    feature_col_types = {
+        col: col_type
+        for col, col_type in pipeline.column_types.items()
+        if col != pipeline.target_column
+    }
+
+    ref_feature_cols = [
+        c for c in ref_df.columns
+        if c in feature_col_types and feature_col_types[c] in ('numeric', 'categorical')
+    ]
+
+    ref_filtered = ref_df[ref_feature_cols].copy()
+    new_feature_cols = [c for c in ref_feature_cols if c in new_df.columns]
+    new_filtered = new_df[new_feature_cols].copy()
+
+    if ref_filtered.empty:
+        st.error("❌ 参考数据集中没有可分析的数值/分类特征，请检查列类型配置。")
+        return None
+
+    return feature_col_types, ref_filtered, new_filtered
+
+
+def _render_sliding_window_controls(pipeline, ref_df, new_df, ref_name, new_name, storage_path):
+    """渲染滑动窗口模式的控制面板，返回是否触发了首次检测"""
+    st.markdown("**🪟 滑动窗口配置**")
+    col_w1, col_w2 = st.columns(2)
+    with col_w1:
+        window_size = st.number_input(
+            "窗口大小(行)", min_value=10, max_value=100000, value=1000, step=50,
+            key="drift_window_size",
+        )
+    with col_w2:
+        step_size = st.number_input(
+            "步长(行)", min_value=1, max_value=10000, value=100, step=10,
+            help="每滑动一次窗口前进的行数",
+            key="drift_step_size",
+        )
+
+    monitor_cfg_key = (
+        f"{ref_name}|{new_name}|"
+        f"{len(ref_df) if ref_df is not None else 0}|"
+        f"{len(new_df) if new_df is not None else 0}|"
+        f"{window_size}|{step_size}"
+    )
+    monitor = st.session_state.drift_monitor
+
+    if monitor is None or getattr(monitor, '_cfg_key', None) != monitor_cfg_key:
+        if st.button("🚀 初始化监控器并加载数据流", type="primary", key="init_monitor_btn"):
+            prep = _prepare_drift_dataframes(pipeline, ref_df, new_df)
+            if prep is None:
+                return False
+            feature_col_types, ref_filtered, new_filtered = prep
+            monitor = SlidingWindowDriftMonitor(
+                reference_data=ref_filtered,
+                column_types=feature_col_types,
+                window_size=int(window_size),
+                step_size=int(step_size),
+            )
+            monitor._cfg_key = monitor_cfg_key
+            monitor.add_data(new_filtered)
+            st.session_state.drift_monitor = monitor
+            st.session_state.drift_window_result = None
+            st.session_state.drift_weighted_psi = None
+            st.success(f"✅ 监控器已初始化，已载入 {len(new_filtered)} 行数据流")
+            st.rerun()
+        return False
+
+    status = monitor.get_status()
+    st.caption(
+        f"缓冲区: {status['buffer_size']} 行 | 当前窗口: "
+        f"[{status['window_start']}:{status['window_start']+status['window_size']}] | "
+        f"可滑动: {'是' if status['can_slide'] else '否'}"
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        auto_interval = st.number_input(
+            "自动检测间隔(秒)",
+            min_value=5, max_value=3600, value=int(st.session_state.drift_auto_interval),
+            step=5, key="drift_auto_interval_input",
+        )
+        st.session_state.drift_auto_interval = int(auto_interval)
+    with col_b:
+        auto_toggle = st.toggle(
+            "自动监控", value=st.session_state.drift_auto_monitoring,
+            key="drift_auto_toggle",
+            help="开启后按间隔自动滑动并检测；关闭需等待当前周期结束",
+        )
+        st.session_state.drift_auto_monitoring = auto_toggle
+
+    btn_detect = st.button("🔬 执行检测(当前窗口)", type="primary", key="detect_window_btn")
+    btn_next = st.button("⏭️ 下一窗口", key="slide_window_btn",
+                         disabled=not status['can_slide'])
+    btn_reset = st.button("♻️ 重置监控器", key="reset_monitor_btn")
+
+    if btn_reset:
+        monitor.reset()
+        st.session_state.drift_window_result = None
+        st.session_state.drift_weighted_psi = None
+        st.session_state.drift_auto_monitoring = False
+        st.rerun()
+
+    triggered = False
+
+    if btn_detect:
+        triggered = _run_window_detection(monitor, storage_path, ref_name, new_name)
+    elif btn_next:
+        if monitor.slide():
+            triggered = _run_window_detection(monitor, storage_path, ref_name, new_name)
+        else:
+            st.warning("已到达数据流末尾，无法继续滑动")
+
+    if st.session_state.drift_auto_monitoring:
+        if monitor.can_slide():
+            monitor.slide()
+            _run_window_detection(monitor, storage_path, ref_name, new_name)
+        else:
+            st.session_state.drift_auto_monitoring = False
+            st.info("数据流已全部检测完毕，自动监控已停止")
+
+    return triggered
+
+
+def _run_window_detection(monitor, storage_path, ref_name, new_name):
+    """对当前窗口执行一次检测并记录趋势"""
+    result = monitor.detect_current_window()
+    if 'error' in result:
+        st.error(result['error'])
+        return False
+
+    weighted_psi = compute_weighted_psi(
+        result.get('feature_psi', {}),
+        st.session_state.drift_feature_weights,
+    )
+
+    st.session_state.drift_trend_tracker.record(result, weighted_psi)
+    st.session_state.drift_window_result = result
+    st.session_state.drift_weighted_psi = weighted_psi
+    st.session_state.drift_last_detector = monitor._detector
+    st.session_state.drift_last_ref_df = monitor.reference_data
+    st.session_state.drift_last_new_df = monitor.get_current_window()
+
+    try:
+        storage = AlertStorage(storage_path=storage_path)
+        storage.save_alert(result, dataset_name=f"{ref_name}_vs_{new_name}")
+    except Exception:
+        pass
+
+    return True
+
+
+def _render_drift_trend_chart(tracker, n_total_features):
+    """渲染漂移趋势追踪图：PSI折线 + 漂移特征数柱状 + 参考线 + 警戒区间阴影"""
+    st.subheader("📊 漂移趋势追踪")
+    st.caption("横轴为检测序号，左纵轴为PSI值(折线)，右纵轴为漂移特征数(柱状)")
+
+    records = tracker.get_records()
+    if not records:
+        st.info("暂无趋势数据，请先执行检测（全量检测或滑动窗口检测均会记录）")
+        return
+
+    seqs = [r['seq'] for r in records]
+    psis = [r['overall_psi'] for r in records]
+    n_drifted = [r['n_drifted'] for r in records]
+    retrain_line = n_total_features * 0.3
+
+    streaks = tracker.get_warning_streaks()
+
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    for s in streaks:
+        ax1.axvspan(s['start_idx'] - 0.4, s['end_idx'] + 0.4,
+                    color='red', alpha=0.12, zorder=0)
+
+    ax1.plot(seqs, psis, 'o-', color='#2980b9', linewidth=2,
+             markersize=6, label='PSI值', zorder=3)
+    ax1.axhline(y=0.1, color='green', linestyle='--', linewidth=1.5,
+                label='稳定线 PSI=0.1')
+    ax1.axhline(y=0.25, color='orange', linestyle='--', linewidth=1.5,
+                label='警戒线 PSI=0.25')
+    ax1.set_xlabel('检测序号')
+    ax1.set_ylabel('PSI值', color='#2980b9')
+    ax1.tick_params(axis='y', labelcolor='#2980b9')
+
+    ax2 = ax1.twinx()
+    ax2.bar(seqs, n_drifted, alpha=0.3, color='#e74c3c', width=0.5,
+            label='漂移特征数', zorder=1)
+    if retrain_line > 0:
+        ax2.axhline(y=retrain_line, color='red', linestyle='--', linewidth=1.5,
+                    label=f'重训线 特征数={retrain_line:.1f}')
+    ax2.set_ylabel('漂移特征数量', color='#e74c3c')
+    ax2.tick_params(axis='y', labelcolor='#e74c3c')
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
+    ax1.set_title('漂移趋势追踪')
+    ax1.grid(True, alpha=0.3)
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    if streaks:
+        longest = max(streaks, key=lambda s: s['length'])
+        st.error(
+            f"🚨 连续 {longest['length']} 次超警戒，强烈建议重训"
+            f"（区间: 第{longest['start_seq']}~{longest['end_seq']}次检测，图中红色阴影标注）"
+        )
+    else:
+        max_streak = tracker.get_max_streak()
+        if max_streak >= 1:
+            st.info(f"当前连续超警戒次数: {max_streak}（达到3次将触发重训告警）")
+
+    with st.expander("📋 查看趋势数据明细"):
+        trend_df = pd.DataFrame(records)
+        display_cols = [c for c in ['seq', 'timestamp', 'overall_psi', 'weighted_psi',
+                                    'n_drifted', 'n_total_features', 'overall_alert_level']
+                        if c in trend_df.columns]
+        st.dataframe(trend_df[display_cols], use_container_width=True)
+
+    col_t1, col_t2 = st.columns([1, 1])
+    with col_t1:
+        if st.button("🗑️ 清空趋势记录", key="clear_trend_btn"):
+            tracker.clear()
+            st.rerun()
+    with col_t2:
+        st.caption(f"共记录 {len(records)} 次检测")
+
+
+def _render_drift_weighted_psi(result, weighted_psi, feature_weights):
+    """渲染加权PSI与非加权PSI对比"""
+    st.subheader("⚖️ 特征重要性加权PSI")
+
+    overall_psi = result.get('overall_psi', 0.0)
+
+    col_w1, col_w2 = st.columns(2)
+    with col_w1:
+        st.metric("非加权PSI", f"{overall_psi:.4f}",
+                  delta="所有特征一视同仁", delta_color="off")
+    with col_w2:
+        if weighted_psi is not None:
+            st.metric("加权PSI", f"{weighted_psi:.4f}",
+                      delta=f"差值: {weighted_psi - overall_psi:+.4f}")
+        else:
+            st.metric("加权PSI", "不可用")
+
+    if weighted_psi is None:
+        st.warning(
+            "⚠️ 加权PSI不可用（需先完成特征选择）。"
+            "请在「特征重要性评估」步骤运行后再回到本页，加权PSI将自动启用。"
+        )
+        return
+
+    if not feature_weights:
+        return
+
+    feature_psi = result.get('feature_psi', {})
+    rows = []
+    for feat, psi_info in feature_psi.items():
+        psi_val = psi_info.get('psi_value', 0.0) if isinstance(psi_info, dict) else 0.0
+        if not np.isfinite(psi_val):
+            continue
+        w = feature_weights.get(feat, 0.0)
+        rows.append({
+            '特征': feat,
+            'PSI值': round(float(psi_val), 4),
+            '重要性权重': round(float(w), 4),
+            '加权贡献': round(float(psi_val) * float(w), 4),
+        })
+    if rows:
+        df_w = pd.DataFrame(rows).sort_values('加权贡献', ascending=False)
+        st.markdown("**各特征加权贡献明细（按加权贡献降序）**")
+        st.dataframe(df_w, use_container_width=True,
+                     height=min(400, len(df_w) * 35 + 40))
+
+    st.caption("💡 加权PSI = Σ(特征PSI × 归一化重要性权重)。对模型预测影响大的特征漂移将获得更高权重。")
+
+
+def _render_drift_drilldown_panel():
+    """渲染漂移根因下钻面板"""
+    st.markdown("---")
+    st.subheader("🔍 漂移根因下钻")
+
+    detector = st.session_state.drift_last_detector
+    new_df = st.session_state.drift_last_new_df
+
+    if detector is None or new_df is None:
+        st.info("请先执行漂移检测，然后选择漂移特征查看详情")
+        return
+
+    result = (st.session_state.drift_window_result
+              if st.session_state.drift_detection_mode == 'sliding'
+              else st.session_state.drift_detection_result)
+    if result is None:
+        st.info("请先执行漂移检测")
+        return
+
+    drifted = result.get('drifted_features', [])
+    all_feats = list(result.get('feature_tests', {}).keys())
+
+    if not all_feats:
+        st.info("无可用特征")
+        return
+
+    options = (drifted if drifted else all_feats)
+    default_idx = 0
+
+    col_d1, col_d2 = st.columns([2, 1])
+    with col_d1:
+        selected = st.selectbox(
+            "选择特征查看下钻详情",
+            options=options,
+            index=default_idx,
+            key="drift_drilldown_feature",
+            format_func=lambda x: f"{'🚨' if x in drifted else '○'} {x}",
+        )
+    with col_d2:
+        st.caption(f"漂移特征 {len(drifted)} 个 | 可下钻特征 {len(all_feats)} 个")
+
+    if selected is None:
+        return
+
+    try:
+        drill = detector.get_feature_drilldown(selected, new_df)
+    except Exception as e:
+        st.error(f"下钻失败: {str(e)}")
+        return
+
+    if 'error' in drill:
+        st.error(drill['error'])
+        return
+
+    with st.expander(f"📊 {selected} 详情面板", expanded=True):
+        _render_drift_drilldown_detail(drill)
+
+
+def _render_drift_drilldown_detail(drill):
+    """渲染单个特征的下钻详情内容"""
+    col_type = drill.get('type', '')
+
+    if col_type == 'numeric':
+        stats = drill.get('stats', {})
+        ref_s = stats.get('reference', {})
+        new_s = stats.get('new', {})
+
+        st.markdown("**描述统计对比**")
+        stat_rows = [
+            ('均值', ref_s.get('mean', 0), new_s.get('mean', 0)),
+            ('中位数', ref_s.get('median', 0), new_s.get('median', 0)),
+            ('标准差', ref_s.get('std', 0), new_s.get('std', 0)),
+            ('最小值', ref_s.get('min', 0), new_s.get('min', 0)),
+            ('最大值', ref_s.get('max', 0), new_s.get('max', 0)),
+            ('缺失率', ref_s.get('missing_rate', 0), new_s.get('missing_rate', 0)),
+            ('有效样本数', ref_s.get('count', 0), new_s.get('count', 0)),
+        ]
+        stats_df = pd.DataFrame(stat_rows, columns=['指标', '参考集', '新数据'])
+        stats_df['变化'] = stats_df['新数据'] - stats_df['参考集']
+        st.dataframe(stats_df, use_container_width=True, hide_index=True)
+
+        st.markdown("**分位数对比**")
+        quantiles = drill.get('quantiles', [])
+        if quantiles:
+            q_df = pd.DataFrame(quantiles)
+            st.dataframe(q_df, use_container_width=True, hide_index=True)
+
+        kde = drill.get('kde', {})
+        if kde.get('available'):
+            st.markdown("**KDE密度曲线叠加**")
+            fig, ax = plt.subplots(figsize=(10, 5))
+            grid = kde['grid']
+            ax.plot(grid, kde['ref_density'], label='参考集', color='#2980b9', linewidth=2)
+            ax.plot(grid, kde['new_density'], label='新数据', color='#e67e22', linewidth=2)
+            ax.fill_between(grid, kde['ref_density'], alpha=0.2, color='#2980b9')
+            ax.fill_between(grid, kde['new_density'], alpha=0.2, color='#e67e22')
+            ax.set_xlabel(drill.get('feature', ''))
+            ax.set_ylabel('密度')
+            ax.set_title(f"{drill.get('feature', '')} KDE密度曲线叠加")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info(f"KDE不可用: {kde.get('reason', '样本数不足')}")
+
+    elif col_type == 'categorical':
+        stats = drill.get('stats', {})
+        ref_s = stats.get('reference', {})
+        new_s = stats.get('new', {})
+
+        st.markdown("**描述统计对比**")
+        cat_stat_rows = [
+            ('类别数', ref_s.get('n_unique', 0), new_s.get('n_unique', 0)),
+            ('众数', ref_s.get('top', ''), new_s.get('top', '')),
+            ('众数频次', ref_s.get('top_freq', 0), new_s.get('top_freq', 0)),
+            ('缺失率', ref_s.get('missing_rate', 0), new_s.get('missing_rate', 0)),
+            ('有效样本数', ref_s.get('count', 0), new_s.get('count', 0)),
+        ]
+        cat_stats_df = pd.DataFrame(cat_stat_rows, columns=['指标', '参考集', '新数据'])
+        st.dataframe(cat_stats_df, use_container_width=True, hide_index=True)
+
+        waterfall = drill.get('waterfall', [])
+        if waterfall:
+            st.markdown("**类别占比变化瀑布图**（参考占比 → 新占比的增减）")
+            top_n = min(len(waterfall), 15)
+            wf = waterfall[:top_n]
+            cats = [str(w['category'])[:15] for w in wf]
+
+            fig, ax = plt.subplots(figsize=(max(8, top_n * 0.8), 6))
+            x = np.arange(len(wf))
+            for i, w in enumerate(wf):
+                ref_p = w['reference']
+                delta = w['delta']
+                ax.bar(i, ref_p, color='#95a5a6', alpha=0.5, width=0.6,
+                       label='参考占比' if i == 0 else None)
+                if delta >= 0:
+                    ax.bar(i, delta, bottom=ref_p, color='#27ae60', alpha=0.85,
+                           width=0.6, label='占比增加' if i == 0 else None)
+                else:
+                    ax.bar(i, abs(delta), bottom=ref_p + delta, color='#e74c3c',
+                           alpha=0.85, width=0.6, label='占比减少' if i == 0 else None)
+            ax.set_xticks(x)
+            ax.set_xticklabels(cats, rotation=45, ha='right', fontsize=9)
+            ax.set_ylabel('占比')
+            ax.set_title(f"{drill.get('feature', '')} 类别占比变化瀑布图")
+            ax.legend(loc='upper right', fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            wf_df = pd.DataFrame(wf)
+            wf_df.columns = ['类别', '参考占比', '新占比', '变化']
+            st.dataframe(wf_df, use_container_width=True, hide_index=True)
+    else:
+        st.info(f"特征类型 {col_type} 暂不支持下钻")
+
+
+
 
 
 def _render_drift_alert_banner(result):
@@ -2042,7 +2592,7 @@ def _render_drift_alert_banner(result):
     st.markdown(html, unsafe_allow_html=True)
 
 
-def _render_drift_metrics_overview(result):
+def _render_drift_metrics_overview(result, weighted_psi=None):
     """渲染整体指标卡片"""
     psi = result.get('overall_psi', 0.0)
     psi_grade = result.get('overall_psi_grade', 'stable')
@@ -2057,7 +2607,7 @@ def _render_drift_metrics_overview(result):
         'severe_drift': '🚨 严重漂移',
     }
 
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 
     with col_m1:
         st.metric(
@@ -2074,6 +2624,16 @@ def _render_drift_metrics_overview(result):
         st.metric("漂移特征占比", f"{drift_pct:.1f}%")
 
     with col_m4:
+        if weighted_psi is not None:
+            st.metric(
+                "加权 PSI",
+                f"{weighted_psi:.4f}",
+                delta=f"差值 {weighted_psi - psi:+.4f}",
+            )
+        else:
+            st.metric("加权 PSI", "不可用", delta="需先完成特征选择")
+
+    with col_m5:
         st.metric(
             "Bonferroni 校正阈值",
             f"{corrected_thresh:.2e}",
